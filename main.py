@@ -3,6 +3,8 @@ import html
 import json
 import logging
 import os
+import speech_recognition as sr
+import tempfile
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
@@ -23,8 +25,10 @@ from aiogram.types import (
 
 logger = logging.getLogger("mif-bot")
 DATABASE_PATH = Path(__file__).with_name("mifs.json")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@MiFFFki")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@MIFFFKI")
 MAX_DESCRIPTION_LENGTH = 700
+MAX_CAPTION_TEXT_LENGTH = 300
+TRANSCRIPTION_TIMEOUT_SECONDS = 20
 
 
 DEFAULT_MIFS: list[dict[str, str]] = [
@@ -34,6 +38,9 @@ DEFAULT_MIFS: list[dict[str, str]] = [
         "file_id": "CQACAgIAAxkBAAEuHO9qkZ03pi_mLbWFOsWW01ynB2cZUAACQQ0AAu5m4EjwVpcEQ4qmpz0E",
         "tags": "окс миф 1",
         "media_type": "audio",
+        "file_type": "audio",
+        "user_tags": "окс миф 1",
+        "bot_tags": "",
     },
     {
         "id": "2",
@@ -41,6 +48,9 @@ DEFAULT_MIFS: list[dict[str, str]] = [
         "file_id": "CQACAgIAAxkBAAEuHPFqkZ0352jEAWpootn6YibYFZpZowACYGIAAt-jkEgtnX7stJl5Lj0E",
         "tags": "мем 2",
         "media_type": "audio",
+        "file_type": "audio",
+        "user_tags": "мем 2",
+        "bot_tags": "",
     },
     {
         "id": "3",
@@ -48,6 +58,9 @@ DEFAULT_MIFS: list[dict[str, str]] = [
         "file_id": "CQACAgIAAxkBAAEuHPJqkZ031jPFF2-6TwFG4V8JEyKEAgACDUkAAhDEgUqWSpFk4iZf9z0E",
         "tags": "мем 3",
         "media_type": "audio",
+        "file_type": "audio",
+        "user_tags": "мем 3",
+        "bot_tags": "",
     },
     {
         "id": "4",
@@ -55,6 +68,9 @@ DEFAULT_MIFS: list[dict[str, str]] = [
         "file_id": "CQACAgIAAxkBAAEuHPNqkZ03lpuLxHkyZ92-BqzLJ45uNAACtQoAAmHC0UpMkDlDJZnKTT0E",
         "tags": "мем 4",
         "media_type": "audio",
+        "file_type": "audio",
+        "user_tags": "мем 4",
+        "bot_tags": "",
     },
     {
         "id": "5",
@@ -62,6 +78,9 @@ DEFAULT_MIFS: list[dict[str, str]] = [
         "file_id": "CQACAgIAAxkBAAEuHPRqkZ03kWvsJw7X42bCEC1T5cOrYwAC_B4AAl0YqUpRRiT9sSu2Hj0E",
         "tags": "мем 5",
         "media_type": "audio",
+        "file_type": "audio",
+        "user_tags": "мем 5",
+        "bot_tags": "",
     },
     {
         "id": "6",
@@ -69,6 +88,9 @@ DEFAULT_MIFS: list[dict[str, str]] = [
         "file_id": "CQACAgIAAxkBAAEuHPBqkZ034-HvwqfoGRjcXCWQogOW4wACqX8AAiq0IUiw_aQAAVa0QZo9BA",
         "tags": "мем 6",
         "media_type": "audio",
+        "file_type": "audio",
+        "user_tags": "мем 6",
+        "bot_tags": "",
     },
 ]
 
@@ -107,6 +129,84 @@ def next_mif_id() -> str:
     return str(max(numeric_ids, default=0) + 1)
 
 
+def clip_text(value: str, max_length: int = MAX_CAPTION_TEXT_LENGTH) -> str:
+    if len(value) <= max_length:
+        return value
+    return f"{value[: max_length - 1].rstrip()}…"
+
+
+async def convert_to_wav(source_path: Path, wav_path: Path) -> None:
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source_path),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-vn",
+        str(wav_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        details = stderr.decode("utf-8", errors="replace")[-1000:]
+        raise RuntimeError(f"ffmpeg завершился с кодом {process.returncode}: {details}")
+
+
+async def transcribe_audio(
+    bot: Bot,
+    file_id: str,
+) -> tuple[str, str | None]:
+    try:
+        telegram_file = await bot.get_file(file_id)
+        if not telegram_file.file_path:
+            raise RuntimeError("Telegram не вернул путь к аудиофайлу")
+
+        with tempfile.TemporaryDirectory(prefix="mif-") as temporary_directory:
+            remote_suffix = Path(telegram_file.file_path).suffix or ".audio"
+            source_path = Path(temporary_directory) / f"source{remote_suffix}"
+            wav_path = Path(temporary_directory) / "converted.wav"
+
+            await bot.download_file(
+                telegram_file.file_path,
+                destination=source_path,
+            )
+            await convert_to_wav(source_path, wav_path)
+
+            recognizer = sr.Recognizer()
+            recognizer.operation_timeout = TRANSCRIPTION_TIMEOUT_SECONDS
+
+            with sr.AudioFile(str(wav_path)) as audio_source:
+                audio_data = recognizer.record(audio_source)
+
+            recognized_text = await asyncio.to_thread(
+                recognizer.recognize_google,
+                audio_data,
+                language="ru-RU",
+            )
+
+            return recognized_text.strip(), None
+    except sr.UnknownValueError:
+        logger.info("Речь в аудиофайле не распознана")
+        return "", "Речь в аудиофайле не распознана."
+    except sr.RequestError:
+        logger.exception("Сервис Speech-to-Text недоступен")
+        return "", "Сервис распознавания речи временно недоступен."
+    except TelegramAPIError:
+        logger.exception("Telegram не дал скачать файл для распознавания")
+        return "", "Не удалось скачать аудиофайл из Telegram."
+    except (OSError, RuntimeError):
+        logger.exception("Не удалось конвертировать аудиофайл через ffmpeg")
+        return "", "Не удалось обработать аудиофайл на сервере."
+    except Exception:
+        logger.exception("Неожиданная ошибка при распознавании аудио")
+        return "", "Произошла ошибка при распознавании речи."
+
+
 MIFS_DATABASE = load_mifs()
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -130,23 +230,22 @@ async def cancel_addition(message: Message, state: FSMContext) -> None:
 async def handle_audio_upload(message: Message, state: FSMContext) -> None:
     if message.audio is not None:
         file_id = message.audio.file_id
-        media_type = "audio"
+        file_type = "audio"
     elif message.voice is not None:
         file_id = message.voice.file_id
-        media_type = "voice"
+        file_type = "voice"
     else:
         await message.answer("Не удалось определить тип аудио.")
         return
 
-    await state.update_data(file_id=file_id, media_type=media_type)
+    await state.update_data(file_id=file_id, file_type=file_type)
     await state.set_state(AddMif.waiting_for_description)
 
     await message.answer(
-        "Аудио получено.\n"
-        "Я автоматически определил file ID.\n\n"
-        "Теперь обязательно отправь текстовое описание и теги "
+        "✅Аудио получено!\n"
+        "⚠️Теперь обязательно отправь описание и теги "
         "(например: Оксимирон мем агрессия).\n"
-        "Чтобы отменить добавление, отправь /cancel."
+        "Для отмены отправь /cancel."
     )
 
 
@@ -156,27 +255,35 @@ async def handle_audio_upload(message: Message, state: FSMContext) -> None:
     F.text,
 )
 async def handle_description(message: Message, state: FSMContext) -> None:
-    description = (message.text or "").strip()
+    user_description = (message.text or "").strip()
 
-    if not description:
-        await message.answer("Описание не может быть пустым. Отправь текстовое описание.")
+    if not user_description:
+        await message.answer("⚠️Описание не может быть пустым.")
         return
 
-    if len(description) > MAX_DESCRIPTION_LENGTH:
+    if len(user_description) > MAX_DESCRIPTION_LENGTH:
         await message.answer(
-            f"Описание слишком длинное. Используй не более {MAX_DESCRIPTION_LENGTH} символов."
+            f"⚠️Описание слишком длинное. Используй не более "
+            f"{MAX_DESCRIPTION_LENGTH} символов."
         )
         return
 
     user_data = await state.get_data()
     file_id = user_data.get("file_id")
-    media_type = user_data.get("media_type", "audio")
+    file_type = user_data.get("file_type", "audio")
 
-    if not isinstance(file_id, str) or media_type not in {"audio", "voice"}:
+    if not isinstance(file_id, str) or file_type not in {"audio", "voice"}:
         await state.clear()
         await message.answer("Срок ожидания описания истёк. Отправь аудио ещё раз.")
         return
 
+    await message.answer("⏳Распознаю слова в аудиофайле...")
+    bot_description, transcription_error = await transcribe_audio(
+        message.bot,
+        file_id,
+    )
+
+    displayed_bot_description = bot_description or "Речь не распознана."
     author = message.from_user
     if author is None:
         author_name = "неизвестный пользователь"
@@ -187,21 +294,29 @@ async def handle_description(message: Message, state: FSMContext) -> None:
 
     post_caption = (
         "<b>Новый MIF добавлен!</b>\n\n"
-        f"<b>Описание:</b> {html.escape(description)}\n"
+        f"<b>Описание от пользователя:</b> "
+        f"{html.escape(clip_text(user_description))}\n"
+        f"<b>Авто-описание от бота:</b> "
+        f"{html.escape(clip_text(displayed_bot_description))}\n"
         f"<b>file_id:</b> <code>{html.escape(file_id)}</code>\n"
         f"<b>Добавил:</b> {html.escape(author_name)}"
     )
 
     new_mif = {
         "id": next_mif_id(),
-        "title": description,
+        "title": user_description,
         "file_id": file_id,
-        "tags": description.lower(),
-        "media_type": media_type,
+        "file_type": file_type,
+        "media_type": file_type,
+        "user_description": user_description,
+        "bot_description": bot_description,
+        "user_tags": user_description.lower(),
+        "bot_tags": bot_description.lower(),
+        "tags": user_description.lower(),
     }
 
     try:
-        if media_type == "voice":
+        if file_type == "voice":
             await message.bot.send_voice(
                 chat_id=CHANNEL_ID,
                 voice=file_id,
@@ -221,32 +336,38 @@ async def handle_description(message: Message, state: FSMContext) -> None:
     except TelegramAPIError:
         logger.exception("Не удалось опубликовать MIF в канале %s", CHANNEL_ID)
         await message.answer(
-            "Не удалось отправить звук в канал. Проверь, что бот добавлен "
-            "администратором канала и имеет право публиковать сообщения.\n"
-            "Текущее добавление не отменено — после исправления можно отправить "
-            "описание ещё раз или использовать /cancel."
+            "⚠️Не удалось отправить звук в канал. Проверь, что бот добавлен "
+            "администратором @MIFFFKI и имеет право публиковать сообщения.\n"
+            "Добавление не отменено — можно исправить права и отправить описание ещё раз "
+            "или использовать /cancel."
         )
         return
     except OSError:
         logger.exception("Не удалось сохранить базу MIFов")
         await message.answer(
-            "Файл отправлен в канал, но сохранить его в локальную базу не удалось. "
-            "Обратись к администратору бота."
+            "⚠️Файл отправлен в канал, но сохранить его в базе не удалось."
         )
         return
 
     await state.clear()
-    await message.answer(
-        "Готово. Звук опубликован в канале, file ID и описание записаны, "
-        "а MIF добавлен в inline-поиск."
-    )
+    if transcription_error:
+        await message.answer(
+            "✅Файл опубликован в @MIFFFKI и добавлен в поиск.\n"
+            f"⚠️Авто-описание: {transcription_error}\n"
+            "Описание и теги пользователя сохранены."
+        )
+    else:
+        await message.answer(
+            "✅Файл опубликован в @MIFFFKI и добавлен в поиск.\n"
+            f"Авто-описание: {bot_description}"
+        )
 
 
 @dp.message(AddMif.waiting_for_description, F.chat.type == "private")
 async def handle_non_text_description(message: Message) -> None:
     await message.answer(
-        "Для добавления обязательно нужно текстовое описание. "
-        "Отправь его обычным текстовым сообщением или используй /cancel."
+        "⚠️Теперь обязательно отправь текстовое описание и теги "
+        "или используй /cancel."
     )
 
 
@@ -256,16 +377,22 @@ async def search_mifs(query: InlineQuery) -> None:
     results = []
 
     for mif in MIFS_DATABASE:
-        title = str(mif.get("title", ""))
-        tags = str(mif.get("tags", ""))
-        if user_input and user_input not in title.lower() and user_input not in tags.lower():
+        user_tags = str(mif.get("user_tags", mif.get("tags", ""))).lower()
+        bot_tags = str(
+            mif.get("bot_tags", mif.get("bot_description", ""))
+        ).lower()
+        title = str(mif.get("title", mif.get("user_description", "Звук")))
+
+        match_user = user_input in user_tags
+        match_bot = user_input in bot_tags
+        if user_input and not (match_user or match_bot):
             continue
 
         mif_id = str(mif.get("id", ""))
         file_id = str(mif.get("file_id", ""))
-        media_type = mif.get("media_type", "audio")
+        file_type = mif.get("file_type", mif.get("media_type", "audio"))
 
-        if media_type == "voice":
+        if file_type == "voice":
             results.append(
                 InlineQueryResultCachedVoice(
                     id=mif_id,
