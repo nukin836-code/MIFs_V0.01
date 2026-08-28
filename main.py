@@ -24,7 +24,8 @@ from aiogram.types import (
 
 
 logger = logging.getLogger("mif-bot")
-DATABASE_PATH = Path(__file__).with_name("mifs.json")
+DATABASE_PATH = Path(__file__).with_name("mifs_database.json")
+LEGACY_DATABASE_PATH = Path(__file__).with_name("mifs.json")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@MIFFFKI")
 MAX_DESCRIPTION_LENGTH = 700
 MAX_CAPTION_TEXT_LENGTH = 300
@@ -96,13 +97,17 @@ DEFAULT_MIFS: list[dict[str, str]] = [
 
 
 def load_mifs() -> list[dict[str, Any]]:
-    if not DATABASE_PATH.exists():
+    source_path = DATABASE_PATH
+    if not source_path.exists() and LEGACY_DATABASE_PATH.exists():
+        source_path = LEGACY_DATABASE_PATH
+
+    if not source_path.exists():
         return [dict(mif) for mif in DEFAULT_MIFS]
 
     try:
-        data = json.loads(DATABASE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8"))
     except (OSError, JSONDecodeError) as error:
-        raise RuntimeError(f"Не удалось прочитать базу MIFов: {DATABASE_PATH}") from error
+        raise RuntimeError(f"Не удалось прочитать базу MIFов: {source_path}") from error
 
     if not isinstance(data, list):
         raise RuntimeError("База MIFов должна содержать JSON-массив")
@@ -208,6 +213,8 @@ async def transcribe_audio(
 
 
 MIFS_DATABASE = load_mifs()
+if not DATABASE_PATH.exists() and LEGACY_DATABASE_PATH.exists():
+    save_mifs()
 dp = Dispatcher(storage=MemoryStorage())
 
 
