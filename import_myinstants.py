@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -29,8 +30,16 @@ LEGACY_DB_FILE = Path(__file__).with_name("mifs.json")
 PAGES_TO_PARSE = 2
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
 RATE_LIMIT_SECONDS = 2.5
-TRANSCRIPTION_SECONDS = 15
 TRANSCRIPTION_TIMEOUT_SECONDS = 20
+# Битрейт голосового Opus — держим в точности как в main.py, чтобы все MIFы
+# были одинакового качества независимо от того, как они попали в базу.
+VOICE_OPUS_BITRATE = "32k"
+
+# ВАЖНО: эти параметры нормализации должны точно совпадать с main.py и
+# reconcile_channel.py — иначе хэши для обнаружения повторок не совпадут
+# между скриптами.
+HASH_WAV_SAMPLE_RATE = "16000"
+HASH_WAV_CHANNELS = "1"
 
 MYINSTANTS_BASE_URL = "https://www.myinstants.com"
 MYINSTANTS_PAGE_URL = f"{MYINSTANTS_BASE_URL}/ru/index/ru/?page={{page}}"
@@ -77,6 +86,13 @@ def next_mif_id(db_data: list[dict[str, Any]]) -> str:
         except (KeyError, TypeError, ValueError):
             continue
     return str(max(numeric_ids, default=0) + 1)
+
+
+def find_duplicate_by_hash(db_data: list[dict[str, Any]], content_hash: str) -> dict[str, Any] | None:
+    for item in db_data:
+        if item.get("content_hash") == content_hash:
+            return item
+    return None
 
 
 def fetch_page(session: requests.Session, url: str) -> str:
@@ -144,12 +160,10 @@ async def convert_to_wav(source_path: Path, wav_path: Path) -> None:
         "-y",
         "-i",
         str(source_path),
-        "-t",
-        str(TRANSCRIPTION_SECONDS),
         "-ar",
-        "16000",
+        HASH_WAV_SAMPLE_RATE,
         "-ac",
-        "1",
+        HASH_WAV_CHANNELS,
         "-vn",
         str(wav_path),
         stdout=asyncio.subprocess.PIPE,
@@ -162,42 +176,102 @@ async def convert_to_wav(source_path: Path, wav_path: Path) -> None:
         raise RuntimeError(f"ffmpeg завершился с кодом {process.returncode}: {details}")
 
 
-async def transcribe_audio(audio_bytes: bytes, title: str) -> tuple[str, str | None]:
-    suffix = ".mp3"
+async def convert_to_ogg_voice(source_path: Path, ogg_path: Path) -> None:
+    """Перегоняет mp3 в Opus/OGG — формат голосовых сообщений Telegram.
+    -vn обязателен: у многих mp3 с MyInstants есть встроенная обложка, ffmpeg
+    иначе пытается запихнуть её как видеопоток в ogg, и Telegram отвечает
+    DOCUMENT_INVALID."""
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        VOICE_OPUS_BITRATE,
+        "-vbr",
+        "on",
+        "-application",
+        "voip",
+        str(ogg_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        details = stderr.decode("utf-8", errors="replace")[-1000:]
+        raise RuntimeError(f"ffmpeg (opus) завершился с кодом {process.returncode}: {details}")
+
+
+def compute_content_hash(wav_path: Path) -> str:
+    hasher = hashlib.sha256()
+    with open(wav_path, "rb") as wav_file:
+        for chunk in iter(lambda: wav_file.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+async def prepare_audio(
+    audio_bytes: bytes,
+    title: str,
+) -> tuple[str, str | None, bytes, str | None]:
+    """Из сырых mp3-байтов готовит: распознанный текст, ogg-байты для
+    публикации как voice и хэш для обнаружения повторок. Скачивание уже
+    произошло раньше — здесь только локальная обработка через ffmpeg."""
     with tempfile.TemporaryDirectory(prefix="mif-import-") as temporary_directory:
-        source_path = Path(temporary_directory) / f"source{suffix}"
+        source_path = Path(temporary_directory) / "source.mp3"
         wav_path = Path(temporary_directory) / "converted.wav"
+        ogg_path = Path(temporary_directory) / "converted.ogg"
         source_path.write_bytes(audio_bytes)
+
+        recognized_text = ""
+        transcription_error: str | None = None
+        content_hash: str | None = None
 
         try:
             await convert_to_wav(source_path, wav_path)
-            recognizer = sr.Recognizer()
-            recognizer.operation_timeout = TRANSCRIPTION_TIMEOUT_SECONDS
-
-            with sr.AudioFile(str(wav_path)) as audio_source:
-                audio_data = recognizer.record(audio_source)
-
-            text = await asyncio.to_thread(
-                recognizer.recognize_google,
-                audio_data,
-                language="ru-RU",
-            )
-            return text.strip(), None
-        except sr.UnknownValueError:
-            logger.info("Речь не распознана: %s", title)
-            return "", "Речь не распознана."
-        except sr.RequestError:
-            logger.exception("Сервис распознавания недоступен: %s", title)
-            return "", "Сервис распознавания временно недоступен."
         except (OSError, RuntimeError):
-            logger.exception("Не удалось обработать звук: %s", title)
-            return "", "Не удалось обработать звук через ffmpeg."
+            logger.exception("Не удалось конвертировать в WAV: %s", title)
+            transcription_error = "Не удалось обработать звук через ffmpeg."
+        else:
+            content_hash = compute_content_hash(wav_path)
+            try:
+                recognizer = sr.Recognizer()
+                recognizer.operation_timeout = TRANSCRIPTION_TIMEOUT_SECONDS
 
+                with sr.AudioFile(str(wav_path)) as audio_source:
+                    audio_data = recognizer.record(audio_source)
 
-def safe_filename(title: str) -> str:
-    cleaned = re.sub(r"[^\w\s-]", "", title, flags=re.UNICODE)
-    cleaned = re.sub(r"\s+", "_", cleaned).strip("_")
-    return f"{(cleaned or 'myinstants_sound')[:80]}.mp3"
+                recognized_text = await asyncio.to_thread(
+                    recognizer.recognize_google,
+                    audio_data,
+                    language="ru-RU",
+                )
+                recognized_text = recognized_text.strip()
+            except sr.UnknownValueError:
+                logger.info("Речь не распознана: %s", title)
+                transcription_error = "Речь не распознана."
+            except sr.RequestError:
+                logger.exception("Сервис распознавания недоступен: %s", title)
+                transcription_error = "Сервис распознавания временно недоступен."
+            except Exception:
+                logger.exception("Неожиданная ошибка при распознавании: %s", title)
+                transcription_error = "Произошла ошибка при распознавании речи."
+
+        try:
+            await convert_to_ogg_voice(source_path, ogg_path)
+        except (OSError, RuntimeError) as error:
+            logger.exception("Не удалось перегнать в Opus/OGG: %s", title)
+            raise RuntimeError(f"Не удалось перегнать звук в голосовой формат: {title}") from error
+
+        return recognized_text, transcription_error, ogg_path.read_bytes(), content_hash
 
 
 def clip_text(value: str, max_length: int = 300) -> str:
@@ -219,7 +293,27 @@ async def import_sound(
         audio_bytes = await asyncio.to_thread(download_audio, session, sound["url"])
         logger.info("Скачан: %s (%.1f КБ)", title, len(audio_bytes) / 1024)
 
-        bot_text, transcription_error = await transcribe_audio(audio_bytes, title)
+        try:
+            bot_text, transcription_error, ogg_bytes, content_hash = await prepare_audio(
+                audio_bytes, title
+            )
+        except RuntimeError:
+            logger.exception("Пропускаю (не удалось подготовить аудио): %s", title)
+            return False
+
+        # Обнаружение повторок по содержимому — ловит тот же звук даже если
+        # он раньше был добавлен вручную под другим названием.
+        if content_hash:
+            duplicate = find_duplicate_by_hash(db, content_hash)
+            if duplicate is not None:
+                logger.info(
+                    "Пропуск повторки по хэшу: «%s» совпадает с «%s»",
+                    title,
+                    duplicate.get("title", "без названия"),
+                )
+                existing_titles.add(title.lower())
+                return False
+
         displayed_bot_text = bot_text or "Речь не распознана."
         post_caption = (
             "<b>MIF с MyInstants</b>\n\n"
@@ -230,29 +324,53 @@ async def import_sound(
             f"<b>Источник:</b> {html.escape(sound['url'])}"
         )
 
-        telegram_message = await bot.send_audio(
+        telegram_message = await bot.send_voice(
             chat_id=CHANNEL_ID,
-            audio=BufferedInputFile(audio_bytes, filename=safe_filename(title)),
+            voice=BufferedInputFile(ogg_bytes, filename="voice.ogg"),
             caption=post_caption,
             parse_mode="HTML",
         )
-        if telegram_message.audio is None:
-            raise RuntimeError("Telegram не вернул объект audio после загрузки")
+        if telegram_message.voice is None:
+            raise RuntimeError("Telegram не вернул объект voice после загрузки")
 
-        file_id = telegram_message.audio.file_id
+        file_id = telegram_message.voice.file_id
+
+        # file_id узнаём только ПОСЛЕ отправки — дописываем его в подпись
+        # поста постфактум. Это то, чего не хватало раньше: без этой строки
+        # reconcile_channel.py не мог напрямую забрать пост, приходилось
+        # выпрашивать file_id у бота отдельным шагом (copy_message).
+        final_caption = (
+            f"{post_caption}\n<b>file_id:</b> <code>{html.escape(file_id)}</code>"
+        )
+        try:
+            await bot.edit_message_caption(
+                chat_id=CHANNEL_ID,
+                message_id=telegram_message.message_id,
+                caption=final_caption,
+                parse_mode="HTML",
+            )
+        except TelegramAPIError:
+            logger.exception(
+                "Не удалось дописать file_id в подпись для «%s» — публикация "
+                "прошла, но при сверке этот пост попадёт в 'осиротевшие'",
+                title,
+            )
+
         db.append(
             {
                 "id": next_mif_id(db),
                 "title": title,
                 "file_id": file_id,
-                "file_type": "audio",
-                "media_type": "audio",
+                "file_type": "voice",
+                "media_type": "voice",
                 "user_description": title,
                 "bot_description": bot_text,
                 "user_tags": title.lower(),
                 "bot_tags": bot_text.lower(),
                 "tags": title.lower(),
                 "source_url": sound["url"],
+                "channel_message_id": telegram_message.message_id,
+                "content_hash": content_hash,
             }
         )
         save_db(db)
@@ -323,7 +441,7 @@ async def main() -> None:
                 for sound in sounds:
                     title_key = sound["title"].lower()
                     if title_key in existing_titles:
-                        logger.info("Пропуск дубликата: %s", sound["title"])
+                        logger.info("Пропуск дубликата по названию: %s", sound["title"])
                         continue
 
                     if await import_sound(
