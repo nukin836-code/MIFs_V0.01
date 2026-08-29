@@ -1,50 +1,51 @@
+"""
+MyInstants: функции скрейпинга (используются mif_loader.py для /loads и
+/loadsSearch) + необязательный самостоятельный batch-импортёр
+(`python import_myinstants.py`).
+
+Обработка звука (ffmpeg/хэш/распознавание) и публикация теперь полностью
+идут через mif_core.py — здесь этой логики больше нет. Раньше она была
+задублирована и со временем разъехалась с тем, что делает сам бот
+(разные форматы публикации, разный дедуп) — вынос в общий модуль это
+исключает: и живой /loads, и этот batch-скрипт гарантированно ведут себя
+одинаково.
+
+/loads в самом боте делает то же самое, что этот скрипт, но по команде в
+чате — гонять этот файл вручную больше не обязательно, он оставлен как
+самостоятельный вариант (например, для разового прогона без бота).
+"""
+
+from __future__ import annotations
+
 import asyncio
-import hashlib
 import html
-import json
 import logging
 import os
 import re
-import speech_recognition as sr
-import tempfile
 import time
-from json import JSONDecodeError
-from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
 import requests
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import BufferedInputFile
-from bs4 import BeautifulSoup
 
+import mif_core
 
 logger = logging.getLogger("mif-importer")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@MIFFFKI")
-DB_FILE = Path(__file__).with_name("mifs_database.json")
-LEGACY_DB_FILE = Path(__file__).with_name("mifs.json")
 
-# 0 означает идти по страницам до первого настоящего 404. Это важно: раньше
-# импортёр молча заканчивался после двух страниц (72 звука), что выглядело как
-# остановка загрузки. Ограничение можно задать через MYINSTANTS_MAX_PAGES.
+# 0 означает идти по страницам до первого настоящего 404.
 MAX_PAGES = int(os.getenv("MYINSTANTS_MAX_PAGES", "0"))
 START_PAGE = max(1, int(os.getenv("MYINSTANTS_START_PAGE", "1")))
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
-RATE_LIMIT_SECONDS = 2.5
+# Пауза между звуками. Поднята с 2.5 до 5 сек по той же причине, что и в
+# mif_loader.py: публикация — это два запроса к каналу подряд (send_voice +
+# правка подписи), и Telegram ограничивает частоту сообщений в один и тот же
+# чат/канал (flood control).
+RATE_LIMIT_SECONDS = 5.0
 PAGE_RETRIES = 4
-TRANSCRIPTION_TIMEOUT_SECONDS = 20
-# Битрейт голосового Opus — держим в точности как в main.py, чтобы все MIFы
-# были одинакового качества независимо от того, как они попали в базу.
-VOICE_OPUS_BITRATE = "32k"
-
-# ВАЖНО: эти параметры нормализации должны точно совпадать с main.py и
-# reconcile_channel.py — иначе хэши для обнаружения повторок не совпадут
-# между скриптами.
-HASH_WAV_SAMPLE_RATE = "16000"
-HASH_WAV_CHANNELS = "1"
 
 MYINSTANTS_BASE_URL = "https://www.myinstants.com"
 MYINSTANTS_PAGE_URL = f"{MYINSTANTS_BASE_URL}/ru/index/ru/?page={{page}}"
@@ -53,51 +54,6 @@ REQUEST_TIMEOUT = (15, 60)
 
 class AudioTooLargeError(Exception):
     pass
-
-
-def load_db() -> list[dict[str, Any]]:
-    source_path = DB_FILE
-    if not source_path.exists() and LEGACY_DB_FILE.exists():
-        source_path = LEGACY_DB_FILE
-
-    if not source_path.exists():
-        return []
-
-    try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
-    except (OSError, JSONDecodeError) as error:
-        raise RuntimeError(f"Не удалось прочитать базу {source_path}") from error
-
-    if not isinstance(data, list):
-        raise RuntimeError(f"Файл {source_path} должен содержать JSON-массив")
-
-    return data
-
-
-def save_db(db_data: list[dict[str, Any]]) -> None:
-    temporary_path = DB_FILE.with_suffix(".tmp")
-    temporary_path.write_text(
-        json.dumps(db_data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary_path.replace(DB_FILE)
-
-
-def next_mif_id(db_data: list[dict[str, Any]]) -> str:
-    numeric_ids = []
-    for item in db_data:
-        try:
-            numeric_ids.append(int(str(item["id"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return str(max(numeric_ids, default=0) + 1)
-
-
-def find_duplicate_by_hash(db_data: list[dict[str, Any]], content_hash: str) -> dict[str, Any] | None:
-    for item in db_data:
-        if item.get("content_hash") == content_hash:
-            return item
-    return None
 
 
 def fetch_page(session: requests.Session, url: str) -> str:
@@ -146,6 +102,8 @@ def extract_mp3_url(button: Any) -> str | None:
 
 
 def parse_page(page_html: str) -> list[dict[str, str]]:
+    from bs4 import BeautifulSoup
+
     soup = BeautifulSoup(page_html, "html.parser")
     sounds: list[dict[str, str]] = []
 
@@ -184,139 +142,14 @@ def download_audio(session: requests.Session, url: str) -> bytes:
     return b"".join(chunks)
 
 
-async def convert_to_wav(source_path: Path, wav_path: Path) -> None:
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source_path),
-        "-ar",
-        HASH_WAV_SAMPLE_RATE,
-        "-ac",
-        HASH_WAV_CHANNELS,
-        "-vn",
-        str(wav_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        details = stderr.decode("utf-8", errors="replace")[-1000:]
-        raise RuntimeError(f"ffmpeg завершился с кодом {process.returncode}: {details}")
-
-
-async def convert_to_ogg_voice(source_path: Path, ogg_path: Path) -> None:
-    """Перегоняет mp3 в Opus/OGG — формат голосовых сообщений Telegram.
-    -vn обязателен: у многих mp3 с MyInstants есть встроенная обложка, ffmpeg
-    иначе пытается запихнуть её как видеопоток в ogg, и Telegram отвечает
-    DOCUMENT_INVALID."""
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source_path),
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "48000",
-        "-c:a",
-        "libopus",
-        "-b:a",
-        VOICE_OPUS_BITRATE,
-        "-vbr",
-        "on",
-        "-application",
-        "voip",
-        str(ogg_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        details = stderr.decode("utf-8", errors="replace")[-1000:]
-        raise RuntimeError(f"ffmpeg (opus) завершился с кодом {process.returncode}: {details}")
-
-
-def compute_content_hash(wav_path: Path) -> str:
-    hasher = hashlib.sha256()
-    with open(wav_path, "rb") as wav_file:
-        for chunk in iter(lambda: wav_file.read(65536), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-async def prepare_audio(
-    audio_bytes: bytes,
-    title: str,
-) -> tuple[str, str | None, bytes, str | None]:
-    """Из сырых mp3-байтов готовит: распознанный текст, ogg-байты для
-    публикации как voice и хэш для обнаружения повторок. Скачивание уже
-    произошло раньше — здесь только локальная обработка через ffmpeg."""
-    with tempfile.TemporaryDirectory(prefix="mif-import-") as temporary_directory:
-        source_path = Path(temporary_directory) / "source.mp3"
-        wav_path = Path(temporary_directory) / "converted.wav"
-        ogg_path = Path(temporary_directory) / "converted.ogg"
-        source_path.write_bytes(audio_bytes)
-
-        recognized_text = ""
-        transcription_error: str | None = None
-        content_hash: str | None = None
-
-        try:
-            await convert_to_wav(source_path, wav_path)
-        except (OSError, RuntimeError):
-            logger.exception("Не удалось конвертировать в WAV: %s", title)
-            transcription_error = "Не удалось обработать звук через ffmpeg."
-        else:
-            content_hash = compute_content_hash(wav_path)
-            try:
-                recognizer = sr.Recognizer()
-                recognizer.operation_timeout = TRANSCRIPTION_TIMEOUT_SECONDS
-
-                with sr.AudioFile(str(wav_path)) as audio_source:
-                    audio_data = recognizer.record(audio_source)
-
-                recognized_text = await asyncio.to_thread(
-                    recognizer.recognize_google,
-                    audio_data,
-                    language="ru-RU",
-                )
-                recognized_text = recognized_text.strip()
-            except sr.UnknownValueError:
-                logger.info("Речь не распознана: %s", title)
-                transcription_error = "Речь не распознана."
-            except sr.RequestError:
-                logger.exception("Сервис распознавания недоступен: %s", title)
-                transcription_error = "Сервис распознавания временно недоступен."
-            except Exception:
-                logger.exception("Неожиданная ошибка при распознавании: %s", title)
-                transcription_error = "Произошла ошибка при распознавании речи."
-
-        try:
-            await convert_to_ogg_voice(source_path, ogg_path)
-        except (OSError, RuntimeError) as error:
-            logger.exception("Не удалось перегнать в Opus/OGG: %s", title)
-            raise RuntimeError(f"Не удалось перегнать звук в голосовой формат: {title}") from error
-
-        return recognized_text, transcription_error, ogg_path.read_bytes(), content_hash
-
-
-def clip_text(value: str, max_length: int = 300) -> str:
-    if len(value) <= max_length:
-        return value
-    return f"{value[: max_length - 1].rstrip()}…"
-
-
 async def import_sound(
     bot: Bot,
     session: requests.Session,
-    db: list[dict[str, Any]],
-    existing_titles: set[str],
     sound: dict[str, str],
+    existing_titles: set[str],
 ) -> bool:
+    """Batch-версия того же пути, что mif_loader.import_one_sound — обе идут
+    через mif_core.prepare_audio_from_bytes / mif_core.publish_voice_mif."""
     title = sound["title"]
 
     try:
@@ -324,17 +157,15 @@ async def import_sound(
         logger.info("Скачан: %s (%.1f КБ)", title, len(audio_bytes) / 1024)
 
         try:
-            bot_text, transcription_error, ogg_bytes, content_hash = await prepare_audio(
-                audio_bytes, title
+            bot_text, transcription_error, ogg_bytes, content_hash = (
+                await mif_core.prepare_audio_from_bytes(audio_bytes)
             )
         except RuntimeError:
             logger.exception("Пропускаю (не удалось подготовить аудио): %s", title)
             return False
 
-        # Обнаружение повторок по содержимому — ловит тот же звук даже если
-        # он раньше был добавлен вручную под другим названием.
         if content_hash:
-            duplicate = find_duplicate_by_hash(db, content_hash)
+            duplicate = mif_core.find_duplicate_by_hash(content_hash)
             if duplicate is not None:
                 logger.info(
                     "Пропуск повторки по хэшу: «%s» совпадает с «%s»",
@@ -345,79 +176,40 @@ async def import_sound(
                 return False
 
         displayed_bot_text = bot_text or "Речь не распознана."
-        post_caption = (
+        base_caption = (
             "<b>MIF с MyInstants</b>\n\n"
             f"<b>Название и теги пользователя:</b> "
-            f"{html.escape(clip_text(title))}\n"
+            f"{html.escape(mif_core.clip_text(title))}\n"
             f"<b>Авто-описание от бота:</b> "
-            f"{html.escape(clip_text(displayed_bot_text))}\n"
+            f"{html.escape(mif_core.clip_text(displayed_bot_text))}\n"
             f"<b>Источник:</b> {html.escape(sound['url'])}"
         )
 
-        telegram_message = await bot.send_voice(
-            chat_id=CHANNEL_ID,
-            voice=BufferedInputFile(ogg_bytes, filename="voice.ogg"),
-            caption=post_caption,
-            parse_mode="HTML",
+        await mif_core.publish_voice_mif(
+            bot,
+            ogg_bytes=ogg_bytes,
+            existing_voice_file_id=None,
+            base_caption=base_caption,
+            title=title,
+            tags_text=title,
+            bot_description=bot_text,
+            content_hash=content_hash,
+            source_url=sound["url"],
         )
-        if telegram_message.voice is None:
-            raise RuntimeError("Telegram не вернул объект voice после загрузки")
-
-        file_id = telegram_message.voice.file_id
-
-        # file_id узнаём только ПОСЛЕ отправки — дописываем его в подпись
-        # поста постфактум. Это то, чего не хватало раньше: без этой строки
-        # reconcile_channel.py не мог напрямую забрать пост, приходилось
-        # выпрашивать file_id у бота отдельным шагом (copy_message).
-        final_caption = (
-            f"{post_caption}\n<b>file_id:</b> <code>{html.escape(file_id)}</code>"
-        )
-        try:
-            await bot.edit_message_caption(
-                chat_id=CHANNEL_ID,
-                message_id=telegram_message.message_id,
-                caption=final_caption,
-                parse_mode="HTML",
-            )
-        except TelegramAPIError:
-            logger.exception(
-                "Не удалось дописать file_id в подпись для «%s» — публикация "
-                "прошла, но при сверке этот пост попадёт в 'осиротевшие'",
-                title,
-            )
-
-        db.append(
-            {
-                "id": next_mif_id(db),
-                "title": title,
-                "file_id": file_id,
-                "file_type": "voice",
-                "media_type": "voice",
-                "user_description": title,
-                "bot_description": bot_text,
-                "user_tags": title.lower(),
-                "bot_tags": bot_text.lower(),
-                "tags": title.lower(),
-                "source_url": sound["url"],
-                "channel_message_id": telegram_message.message_id,
-                "content_hash": content_hash,
-            }
-        )
-        save_db(db)
         existing_titles.add(title.lower())
 
         if transcription_error:
             logger.warning("Добавлен без авто-описания: %s — %s", title, transcription_error)
         else:
             logger.info("Авто-описание получено для: %s", title)
-        logger.info("Добавлен в базу: %s, file_id получен от Telegram", title)
+        logger.info("Добавлен в базу: %s", title)
         return True
     except AudioTooLargeError:
         logger.info("Пропущен, больше 20 МБ: %s", title)
     except requests.RequestException:
         logger.exception("Не удалось скачать звук: %s", title)
     except TelegramAPIError:
-        logger.exception("Telegram не принял звук для канала %s: %s", CHANNEL_ID, title)
+        logger.exception("Telegram не принял звук для канала %s: %s", mif_core.CHANNEL_ID, title)
     except OSError:
         logger.exception("Не удалось сохранить базу после импорта: %s", title)
     except Exception:
@@ -435,13 +227,9 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    db = load_db()
-    if not DB_FILE.exists() and LEGACY_DB_FILE.exists():
-        save_db(db)
-
     existing_titles = {
         str(item.get("title", "")).strip().lower()
-        for item in db
+        for item in mif_core.MIFS_DATABASE
         if item.get("title")
     }
     headers = {
@@ -457,7 +245,7 @@ async def main() -> None:
         "Начинаем импорт с MyInstants: стартовая страница=%s, лимит=%s, канал=%s",
         START_PAGE,
         page_limit,
-        CHANNEL_ID,
+        mif_core.CHANNEL_ID,
     )
 
     with requests.Session() as session:
@@ -496,13 +284,7 @@ async def main() -> None:
                         logger.info("Пропуск дубликата по названию: %s", sound["title"])
                         continue
 
-                    if await import_sound(
-                        bot,
-                        session,
-                        db,
-                        existing_titles,
-                        sound,
-                    ):
+                    if await import_sound(bot, session, sound, existing_titles):
                         total_added += 1
 
                     await asyncio.sleep(RATE_LIMIT_SECONDS)
