@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
@@ -120,14 +121,18 @@ def next_id(database: list[dict[str, Any]]) -> int:
 def parse_caption(caption: str) -> dict[str, str] | None:
     """Достаёт метаданные из подписи. Понимает оба шаблона (бот / MyInstants).
     Возвращает None, если это не пост нашего формата вообще."""
-    user_desc_match = USER_DESC_RE.search(caption)
-    bot_desc_match = BOT_DESC_RE.search(caption)
+    # Подписи, созданные ботом, содержат HTML-разметку вида
+    # "<b>Описание от пользователя:</b> текст". Pyrogram может вернуть её
+    # вместе с caption, поэтому сначала приводим подпись к обычному тексту.
+    plain_caption = html.unescape(re.sub(r"<[^>]*>", "", caption))
+    user_desc_match = USER_DESC_RE.search(plain_caption)
+    bot_desc_match = BOT_DESC_RE.search(plain_caption)
 
     if not user_desc_match and not bot_desc_match:
         return None
 
-    file_id_match = FILE_ID_RE.search(caption)
-    source_match = SOURCE_RE.search(caption)
+    file_id_match = FILE_ID_RE.search(plain_caption)
+    source_match = SOURCE_RE.search(plain_caption)
 
     return {
         "file_id": file_id_match.group(1).strip() if file_id_match else "",
