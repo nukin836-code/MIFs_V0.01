@@ -262,6 +262,7 @@ async def handle_loads_search(message: Message, query: str) -> None:
     session.headers.update(MYINSTANTS_HEADERS)
     search_url = f"{importer.MYINSTANTS_BASE_URL}/search/?name={quote_plus(query)}"
     
+    
     try:
         page_html = await asyncio.to_thread(importer.fetch_page, session, search_url)
         sounds = importer.parse_page(page_html)
