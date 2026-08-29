@@ -47,3 +47,7 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Telegram user authorization created by reconcile_channel.py
+admin_session.session
+admin_session.session-journal
