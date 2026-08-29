@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -34,6 +35,12 @@ TRANSCRIPTION_TIMEOUT_SECONDS = 20
 # Битрейт голосового Opus. 32k с запасом хватает для разборчивой речи/мемов
 # и держит файлы маленькими — то, что нужно для голосовых сообщений Telegram.
 VOICE_OPUS_BITRATE = "32k"
+
+# Параметры нормализации для хэша дубликатов. ВАЖНО: если поменяешь эти
+# значения — поменяй точно так же в reconcile_channel.py, иначе хэши,
+# посчитанные ботом и скриптом сверки, перестанут совпадать.
+HASH_WAV_SAMPLE_RATE = "16000"
+HASH_WAV_CHANNELS = "1"
 
 
 DEFAULT_MIFS: list[dict[str, str]] = [
@@ -151,9 +158,9 @@ async def convert_to_wav(source_path: Path, wav_path: Path) -> None:
         "-i",
         str(source_path),
         "-ar",
-        "16000",
+        HASH_WAV_SAMPLE_RATE,
         "-ac",
-        "1",
+        HASH_WAV_CHANNELS,
         "-vn",
         str(wav_path),
         stdout=asyncio.subprocess.PIPE,
@@ -175,6 +182,7 @@ async def convert_to_ogg_voice(source_path: Path, ogg_path: Path) -> None:
         "-y",
         "-i",
         str(source_path),
+        "-vn",
         "-ac",
         "1",
         "-ar",
@@ -198,17 +206,36 @@ async def convert_to_ogg_voice(source_path: Path, ogg_path: Path) -> None:
         raise RuntimeError(f"ffmpeg (opus) завершился с кодом {process.returncode}: {details}")
 
 
+def compute_content_hash(wav_path: Path) -> str:
+    """Хэш нормализованного (16kHz mono) WAV — используется для обнаружения
+    повторок независимо от исходного формата/битрейта/контейнера файла.
+    ffmpeg-параметры нормализации должны совпадать с reconcile_channel.py."""
+    hasher = hashlib.sha256()
+    with open(wav_path, "rb") as wav_file:
+        for chunk in iter(lambda: wav_file.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def find_duplicate_by_hash(content_hash: str) -> dict[str, Any] | None:
+    for mif in MIFS_DATABASE:
+        if mif.get("content_hash") == content_hash:
+            return mif
+    return None
+
+
 async def prepare_audio(
     bot: Bot,
     file_id: str,
     file_type: str,
-) -> tuple[str, str | None, bytes | None]:
+) -> tuple[str, str | None, bytes | None, str | None]:
     """Скачивает исходное аудио один раз и параллельно готовит:
     1) распознанный текст (для авто-описания),
     2) байты Opus/OGG-версии для публикации как голосового сообщения
-       (только если исходник ещё не был голосовым — voice уже в нужном формате).
+       (только если исходник ещё не был голосовым — voice уже в нужном формате),
+    3) хэш нормализованного звука — для обнаружения повторок.
 
-    Возвращает (распознанный_текст, ошибка_распознавания, ogg_bytes_или_None).
+    Возвращает (распознанный_текст, ошибка_распознавания, ogg_bytes_или_None, content_hash_или_None).
     Кидает RuntimeError, если не получилось скачать файл или (для не-voice
     исходников) перегнать его в Opus — это фатальная ошибка публикации.
     """
@@ -232,33 +259,37 @@ async def prepare_audio(
 
         recognized_text = ""
         transcription_error: str | None = None
+        content_hash: str | None = None
+
         try:
             await convert_to_wav(source_path, wav_path)
-
-            recognizer = sr.Recognizer()
-            recognizer.operation_timeout = TRANSCRIPTION_TIMEOUT_SECONDS
-
-            with sr.AudioFile(str(wav_path)) as audio_source:
-                audio_data = recognizer.record(audio_source)
-
-            recognized_text = await asyncio.to_thread(
-                recognizer.recognize_google,
-                audio_data,
-                language="ru-RU",
-            )
-            recognized_text = recognized_text.strip()
-        except sr.UnknownValueError:
-            logger.info("Речь в аудиофайле не распознана")
-            transcription_error = "Речь в аудиофайле не распознана."
-        except sr.RequestError:
-            logger.exception("Сервис Speech-to-Text недоступен")
-            transcription_error = "Сервис распознавания речи временно недоступен."
         except (OSError, RuntimeError):
-            logger.exception("Не удалось конвертировать аудиофайл через ffmpeg (STT)")
+            logger.exception("Не удалось конвертировать аудиофайл через ffmpeg (WAV)")
             transcription_error = "Не удалось обработать аудио для распознавания речи."
-        except Exception:
-            logger.exception("Неожиданная ошибка при распознавании аудио")
-            transcription_error = "Произошла ошибка при распознавании речи."
+        else:
+            content_hash = compute_content_hash(wav_path)
+            try:
+                recognizer = sr.Recognizer()
+                recognizer.operation_timeout = TRANSCRIPTION_TIMEOUT_SECONDS
+
+                with sr.AudioFile(str(wav_path)) as audio_source:
+                    audio_data = recognizer.record(audio_source)
+
+                recognized_text = await asyncio.to_thread(
+                    recognizer.recognize_google,
+                    audio_data,
+                    language="ru-RU",
+                )
+                recognized_text = recognized_text.strip()
+            except sr.UnknownValueError:
+                logger.info("Речь в аудиофайле не распознана")
+                transcription_error = "Речь в аудиофайле не распознана."
+            except sr.RequestError:
+                logger.exception("Сервис Speech-to-Text недоступен")
+                transcription_error = "Сервис распознавания речи временно недоступен."
+            except Exception:
+                logger.exception("Неожиданная ошибка при распознавании аудио")
+                transcription_error = "Произошла ошибка при распознавании речи."
 
         ogg_bytes: bytes | None = None
         if file_type != "voice":
@@ -272,7 +303,7 @@ async def prepare_audio(
                 ) from error
             ogg_bytes = ogg_path.read_bytes()
 
-        return recognized_text, transcription_error, ogg_bytes
+        return recognized_text, transcription_error, ogg_bytes, content_hash
 
 
 MIFS_DATABASE = load_mifs()
@@ -350,7 +381,7 @@ async def handle_description(message: Message, state: FSMContext) -> None:
     await message.answer("⏳Распознаю слова и готовлю голосовое сообщение...")
 
     try:
-        bot_description, transcription_error, ogg_bytes = await prepare_audio(
+        bot_description, transcription_error, ogg_bytes, content_hash = await prepare_audio(
             message.bot,
             file_id,
             file_type,
@@ -363,6 +394,22 @@ async def handle_description(message: Message, state: FSMContext) -> None:
             "или использовать /cancel."
         )
         return
+
+    # Обнаружение повторок: сравниваем хэш нормализованного звука со всеми
+    # уже сохранёнными. Разные битрейты/форматы одного и того же звука дадут
+    # одинаковый хэш, потому что хэшируем уже нормализованный WAV.
+    if content_hash:
+        duplicate = find_duplicate_by_hash(content_hash)
+        if duplicate is not None:
+            await state.clear()
+            duplicate_title = duplicate.get("title") or "без названия"
+            await message.answer(
+                f"⚠️Такой звук уже есть в базе: «{duplicate_title}». "
+                "Повторно не публикую.\n"
+                "Если тебе кажется, что это ошибка — обрежь/измени файл немного "
+                "и пришли ещё раз."
+            )
+            return
 
     displayed_bot_description = bot_description or "Речь не распознана."
     author = message.from_user
@@ -429,6 +476,7 @@ async def handle_description(message: Message, state: FSMContext) -> None:
         "bot_tags": bot_description.lower(),
         "tags": user_description.lower(),
         "channel_message_id": sent_message.message_id,
+        "content_hash": content_hash,
     }
 
     try:
@@ -455,13 +503,6 @@ async def handle_description(message: Message, state: FSMContext) -> None:
             f"Авто-описание: {bot_description}"
         )
 
-
-@dp.message(AddMif.waiting_for_description, F.chat.type == "private")
-async def handle_non_text_description(message: Message) -> None:
-    await message.answer(
-        "⚠️Теперь обязательно отправь текстовое описание и теги "
-        "или используй /cancel."
-    )
 
 
 @dp.inline_query()
@@ -532,4 +573,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
