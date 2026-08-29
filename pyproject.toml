@@ -6,6 +6,8 @@ requires-python = ">=3.13"
 dependencies = [
     "aiogram>=3.31.0",
     "beautifulsoup4>=4.15.0",
+    "pyrogram>=2.0.106",
     "requests>=2.34.2",
     "speechrecognition>=3.17.0",
+    "tgcrypto>=1.2.5",
 ]

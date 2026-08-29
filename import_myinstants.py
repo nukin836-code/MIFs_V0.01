@@ -7,6 +7,7 @@ import os
 import re
 import speech_recognition as sr
 import tempfile
+import time
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
@@ -26,10 +27,14 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "@MIFFFKI")
 DB_FILE = Path(__file__).with_name("mifs_database.json")
 LEGACY_DB_FILE = Path(__file__).with_name("mifs.json")
 
-# На одной странице MyInstants обычно около 70 звуков.
-PAGES_TO_PARSE = 2
+# 0 означает идти по страницам до первого настоящего 404. Это важно: раньше
+# импортёр молча заканчивался после двух страниц (72 звука), что выглядело как
+# остановка загрузки. Ограничение можно задать через MYINSTANTS_MAX_PAGES.
+MAX_PAGES = int(os.getenv("MYINSTANTS_MAX_PAGES", "0"))
+START_PAGE = max(1, int(os.getenv("MYINSTANTS_START_PAGE", "1")))
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
 RATE_LIMIT_SECONDS = 2.5
+PAGE_RETRIES = 4
 TRANSCRIPTION_TIMEOUT_SECONDS = 20
 # Битрейт голосового Opus — держим в точности как в main.py, чтобы все MIFы
 # были одинакового качества независимо от того, как они попали в базу.
@@ -96,9 +101,34 @@ def find_duplicate_by_hash(db_data: list[dict[str, Any]], content_hash: str) -> 
 
 
 def fetch_page(session: requests.Session, url: str) -> str:
-    response = session.get(url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    return response.text
+    last_error: requests.RequestException | None = None
+    for attempt in range(1, PAGE_RETRIES + 1):
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.text
+        except requests.HTTPError as error:
+            # 404 означает, что страницы закончились. Повторять такой запрос
+            # бессмысленно; вызывающий код обработает его отдельно.
+            if error.response is not None and error.response.status_code in {404, 410}:
+                raise
+            last_error = error
+        except requests.RequestException as error:
+            last_error = error
+
+        if attempt < PAGE_RETRIES:
+            delay = min(30.0, float(2 ** (attempt - 1)))
+            logger.warning(
+                "Ошибка загрузки страницы (попытка %d/%d), повтор через %.0f с: %s",
+                attempt,
+                PAGE_RETRIES,
+                delay,
+                url,
+            )
+            time.sleep(delay)
+
+    assert last_error is not None
+    raise last_error
 
 
 def extract_mp3_url(button: Any) -> str | None:
@@ -422,21 +452,43 @@ async def main() -> None:
     }
     total_added = 0
 
-    logger.info("Начинаем импорт с MyInstants: страниц=%s, канал=%s", PAGES_TO_PARSE, CHANNEL_ID)
+    page_limit = MAX_PAGES or "до конца пагинации"
+    logger.info(
+        "Начинаем импорт с MyInstants: стартовая страница=%s, лимит=%s, канал=%s",
+        START_PAGE,
+        page_limit,
+        CHANNEL_ID,
+    )
 
     with requests.Session() as session:
         session.headers.update(headers)
         async with Bot(token=BOT_TOKEN) as bot:
-            for page in range(1, PAGES_TO_PARSE + 1):
+            page = START_PAGE
+            while MAX_PAGES == 0 or page < START_PAGE + MAX_PAGES:
                 page_url = MYINSTANTS_PAGE_URL.format(page=page)
                 try:
                     page_html = await asyncio.to_thread(fetch_page, session, page_url)
                     sounds = parse_page(page_html)
+                except requests.HTTPError as error:
+                    if error.response is not None and error.response.status_code in {404, 410}:
+                        logger.info("Страницы закончились на странице %s.", page)
+                        break
+                    logger.exception("Не удалось загрузить страницу: %s", page_url)
+                    page += 1
+                    continue
                 except requests.RequestException:
                     logger.exception("Не удалось загрузить страницу: %s", page_url)
+                    page += 1
                     continue
 
                 logger.info("Страница %s: найдено звуков=%s", page, len(sounds))
+                if not sounds:
+                    logger.warning(
+                        "На странице %s не найдено звуков. Останавливаюсь, "
+                        "чтобы не публиковать непредсказуемые страницы.",
+                        page,
+                    )
+                    break
 
                 for sound in sounds:
                     title_key = sound["title"].lower()
@@ -454,6 +506,7 @@ async def main() -> None:
                         total_added += 1
 
                     await asyncio.sleep(RATE_LIMIT_SECONDS)
+                page += 1
 
     logger.info("Импорт завершён. Добавлено новых MIFов: %s", total_added)
 

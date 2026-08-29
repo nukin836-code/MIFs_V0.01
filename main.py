@@ -327,6 +327,20 @@ async def cancel_addition(message: Message, state: FSMContext) -> None:
     await message.answer("Добавление звука отменено.")
 
 
+@dp.message(Command("start"), F.chat.type == "private")
+async def start_private_chat(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Привет! Я ищу MIF-звуки через inline-режим.\n\n"
+        "Чтобы добавить звук:\n"
+        "1. Отправь мне аудиофайл или голосовое сообщение.\n"
+        "2. Следующим сообщением напиши название и теги "
+        "(например: «Оксимирон мем агрессия»).\n\n"
+        "После этого звук попадёт в канал и станет доступен в поиске.\n"
+        "Для отмены незавершённого добавления отправь /cancel."
+    )
+
+
 @dp.message(F.chat.type == "private", F.audio | F.voice)
 async def handle_audio_upload(message: Message, state: FSMContext) -> None:
     if message.audio is not None:
@@ -420,13 +434,12 @@ async def handle_description(message: Message, state: FSMContext) -> None:
     else:
         author_name = author.full_name
 
-    post_caption = (
+    base_caption = (
         "<b>Новый MIF добавлен!</b>\n\n"
         f"<b>Описание от пользователя:</b> "
         f"{html.escape(clip_text(user_description))}\n"
         f"<b>Авто-описание от бота:</b> "
         f"{html.escape(clip_text(displayed_bot_description))}\n"
-        f"<b>file_id:</b> <code>{html.escape(file_id)}</code>\n"
         f"<b>Добавил:</b> {html.escape(author_name)}"
     )
 
@@ -445,7 +458,7 @@ async def handle_description(message: Message, state: FSMContext) -> None:
         sent_message = await message.bot.send_voice(
             chat_id=CHANNEL_ID,
             voice=voice_source,
-            caption=post_caption,
+            caption=base_caption,
             parse_mode="HTML",
         )
     except TelegramAPIError:
@@ -459,10 +472,24 @@ async def handle_description(message: Message, state: FSMContext) -> None:
         return
 
     # file_id голосового сообщения в канале — это то, что бот будет отдавать
-    # в инлайн-поиске. Канал остаётся источником правды: если локальный кэш
-    # потеряется, reconcile_channel.py восстановит записи из истории канала
-    # по этому же file_id, зашитому в подпись поста выше.
-    resolved_file_id = sent_message.voice.file_id if sent_message.voice else file_id
+    # в инлайн-поиске. Для audio исходный file_id вообще относится к другому
+    # объекту, поэтому в подпись можно писать только ID после send_voice.
+    resolved_file_id = sent_message.voice.file_id
+    final_caption = f"{base_caption}\n<b>file_id:</b> <code>{html.escape(resolved_file_id)}</code>"
+    try:
+        await message.bot.edit_message_caption(
+            chat_id=CHANNEL_ID,
+            message_id=sent_message.message_id,
+            caption=final_caption,
+            parse_mode="HTML",
+        )
+    except TelegramAPIError:
+        # Кэш всё равно содержит правильный ID. Если подпись не удалось
+        # изменить, reconcile_channel.py получит ID через copy_message.
+        logger.exception(
+            "Не удалось дописать фактический file_id в подпись поста %s",
+            sent_message.message_id,
+        )
 
     new_mif = {
         "id": next_mif_id(),
