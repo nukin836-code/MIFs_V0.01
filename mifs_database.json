@@ -99,5 +99,35 @@
     "tags": "здравствуйте ничтожные нищие смертные",
     "channel_message_id": 96,
     "content_hash": "6a483f5034f51c52d0600b77d6255673b468c442b3e14967f53b509a28a79afd"
+  },
+  {
+    "id": "12",
+    "title": "Звук фотоаппарата",
+    "file_id": "AwACAgIAAyEGAAMBAAHYslQAA_Jqk8HQpKiuCzzeOzCrBKT8ESFqhwACWKcAAh7noEh8agUm_lVmND0E",
+    "file_type": "voice",
+    "media_type": "voice",
+    "user_description": "Звук фотоаппарата",
+    "bot_description": "",
+    "user_tags": "звук фотоаппарата",
+    "bot_tags": "",
+    "tags": "звук фотоаппарата",
+    "channel_message_id": 242,
+    "content_hash": "f03988138e9cdbac06e2db1b32bb49f11914303d3cafa45709b2ad1d33a85461",
+    "source_url": "https://www.myinstants.com/media/sounds/zvuk-fotoapparata.mp3"
+  },
+  {
+    "id": "13",
+    "title": "запустил семя в арбуз",
+    "file_id": "AwACAgIAAyEGAAMBAAHYslQAA_Nqk8HUs9dOAs1GHWUNYTg_FanSIgACWacAAh7noEg_vbWTxx3ShD0E",
+    "file_type": "voice",
+    "media_type": "voice",
+    "user_description": "запустил семя в арбуз",
+    "bot_description": "запустил Сеня в арбуз ой Пахан жирный индус залетаю маме в туз Называй меня петух",
+    "user_tags": "запустил семя в арбуз",
+    "bot_tags": "запустил сеня в арбуз ой пахан жирный индус залетаю маме в туз называй меня петух",
+    "tags": "запустил семя в арбуз",
+    "channel_message_id": 243,
+    "content_hash": "a85da927c795ccb65a3f337a01974e4e3e514e6a5e86e49330be6d42cc864767",
+    "source_url": "https://www.myinstants.com/media/sounds/zapustil-semia-v-arbuz.mp3"
   }
 ]
