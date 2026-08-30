@@ -7,7 +7,6 @@ dependencies = [
     "aiogram>=3.31.0",
     "beautifulsoup4>=4.15.0",
     "pyrogram>=2.0.106",
-    "rapidfuzz>=3.14.5",
     "requests>=2.34.2",
     "speechrecognition>=3.17.0",
     "tgcrypto>=1.2.5",
