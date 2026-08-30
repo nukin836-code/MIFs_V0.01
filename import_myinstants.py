@@ -83,7 +83,7 @@ MYINSTANTS_CATEGORIES: list[str] = [
     "viral",
     "whatsapp audios",
 ]
-MYINSTANTS_CATEGORY_URL = f"{MYINSTANTS_BASE_URL}/en/categories/{{category}}/"
+MYINSTANTS_CATEGORY_URL = f"{MYINSTANTS_BASE_URL}/ru/categories/{{category}}/"
 
 # Сколько страниц внутри ОДНОЙ категории просматривать при /loadsSearch —
 # сайт больше не даёт искать по всему каталогу разом, так что это честный
