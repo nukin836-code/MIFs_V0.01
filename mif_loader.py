@@ -18,7 +18,6 @@ import logging
 import os
 import re
 from typing import Any
-from urllib.parse import quote_plus
 
 import requests
 from aiogram import Bot
@@ -42,13 +41,6 @@ LOADS_ADMIN_ID = int(os.getenv("LOADS_ADMIN_ID", "1297417116"))
 # точной подсказке Telegram, если он всё же сработает несмотря на паузу —
 # так что звук не потеряется, просто немного задержится.
 LOADS_STEP_DELAY_SECONDS = 5.0
-
-MYINSTANTS_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
-    )
-}
 
 LOADS_SEARCH_RE = re.compile(r'^/loadsSearch\s+"?([^"]+?)"?\s*$')
 LOADS_COUNT_RE = re.compile(r"^/loads(\d+)$")
@@ -133,46 +125,45 @@ async def import_one_sound(
 
 async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> None:
     session = requests.Session()
-    session.headers.update(MYINSTANTS_HEADERS)
+    session.headers.update(importer.MYINSTANTS_HEADERS)
+    pager = importer.CatalogPager()
 
     try:
-        page = 1
-        empty_page_streak = 0
-
         while not loader_state.stop_event.is_set():
             if target_count is not None and loader_state.added_count >= target_count:
                 break
 
-            page_url = importer.MYINSTANTS_PAGE_URL.format(page=page)
+            page_url = pager.current_url
             try:
                 page_html = await asyncio.to_thread(importer.fetch_page, session, page_url)
                 sounds = importer.parse_page(page_html)
             except requests.HTTPError as error:
                 if error.response is not None and error.response.status_code in {404, 410}:
-                    # Страницы закончились — начинаем сканирование заново.
-                    page = 1
-                    empty_page_streak = 0
+                    # Эта категория на этой странице закончилась — идём в
+                    # следующую категорию, а не пытаемся листать бесконечно.
+                    pager.advance_category()
                 else:
                     await mif_core.report_bug(
-                        bot, f"Автозагрузка: страница {page} не загрузилась: {error}"
+                        bot,
+                        f"Автозагрузка: категория «{pager.current_category}» "
+                        f"не загрузилась: {error}",
                     )
-                    page += 1
+                    pager.advance_category()
                 await asyncio.sleep(LOADS_STEP_DELAY_SECONDS)
                 continue
             except requests.RequestException as error:
                 await mif_core.report_bug(
-                    bot, f"Автозагрузка: страница {page} не загрузилась: {error}"
+                    bot,
+                    f"Автозагрузка: категория «{pager.current_category}» не загрузилась: {error}",
                 )
-                page += 1
+                pager.advance_category()
                 await asyncio.sleep(LOADS_STEP_DELAY_SECONDS)
                 continue
 
             if not sounds:
-                empty_page_streak += 1
-                page = 1 if empty_page_streak >= 2 else page + 1
+                pager.advance_category()
                 await asyncio.sleep(LOADS_STEP_DELAY_SECONDS)
                 continue
-            empty_page_streak = 0
 
             for sound in sounds:
                 if loader_state.stop_event.is_set():
@@ -203,7 +194,7 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
 
                 await asyncio.sleep(LOADS_STEP_DELAY_SECONDS)
 
-            page += 1
+            pager.advance_page()
     finally:
         try:
             await bot.send_message(
@@ -258,24 +249,27 @@ async def handle_loads_search(message: Message, query: str) -> None:
         await message.answer('Укажи запрос: /loadsSearch "текст".')
         return
 
+    # У сайта больше нет рабочего поиска по произвольному тексту (см.
+    # комментарий над MYINSTANTS_CATEGORIES в import_myinstants.py) — сканим
+    # категории сами, это занимает секунд 5-15, поэтому сразу отвечаем, что
+    # не зависли.
+    await message.answer("🔍Ищу на MyInstants, это может занять до ~15 секунд...")
+
     session = requests.Session()
-    session.headers.update(MYINSTANTS_HEADERS)
-    search_url = f"{importer.MYINSTANTS_BASE_URL}/search/?name={quote_plus(query)}"
-    
-    
+    session.headers.update(importer.MYINSTANTS_HEADERS)
+
     try:
-        page_html = await asyncio.to_thread(importer.fetch_page, session, search_url)
-        sounds = importer.parse_page(page_html)
+        candidates = await importer.search_catalog(session, query)
     except requests.RequestException:
         logger.exception("Ошибка поиска на MyInstants: %s", query)
         await message.answer("⚠️Не удалось обратиться к MyInstants. Попробуй ещё раз позже.")
         return
 
-    if not sounds:
-        await message.answer(f"На MyInstants ничего не нашлось по запросу «{query}».")
+    if not candidates:
+        await message.answer(f"На MyInstants ничего похожего на «{query}» не нашлось.")
         return
 
-    sound = sounds[0]
+    sound = candidates[0]
 
     existing_by_title = mif_core.find_duplicate_by_title(sound["title"])
     if existing_by_title is not None:
@@ -304,6 +298,64 @@ async def handle_loads_search(message: Message, query: str) -> None:
         return
 
     await message.answer(f"⚠️Не удалось загрузить «{sound['title']}». Попробуй другой запрос.")
+
+
+async def background_internet_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
+    """Локальный инлайн-поиск дал слабое совпадение (см. main.py:search_mifs)
+    — пробуем найти похожий звук на MyInstants в фоне и, если получится,
+    публикуем его (через тот же import_one_sound/publish_voice_mif, что и
+    везде) и присылаем автору запроса личным сообщением.
+
+    ВАЖНО: это не может попасть в тот же самый инлайн-ответ — Telegram не
+    ждёт секунды сканирования+скачивания+конвертации на инлайн-запрос,
+    результат обязательно приходит отдельным сообщением позже.
+
+    ТАКЖЕ ВАЖНО: сработает, только если requester_id уже хотя бы раз писал
+    боту (/start) — Telegram не разрешает ботам первыми писать пользователю.
+    Если это не так, просто тихо логируем и ничего не ломаем — человек и
+    так уже получил обычный (пустой/слабый) инлайн-ответ.
+    """
+    try:
+        session = requests.Session()
+        session.headers.update(importer.MYINSTANTS_HEADERS)
+
+        candidates = await importer.search_catalog(session, query_text, max_results=1)
+        if not candidates:
+            return
+
+        sound = candidates[0]
+
+        existing = mif_core.find_duplicate_by_title(sound["title"])
+        if existing is not None:
+            await bot.send_message(
+                requester_id, f"Кстати, по запросу «{query_text}» — «{sound['title']}» уже есть:"
+            )
+            await bot.send_voice(requester_id, voice=existing["file_id"])
+            return
+
+        status, entry = await import_one_sound(bot, session, sound)
+        if status != "added" or entry is None:
+            return
+
+        await bot.send_message(
+            requester_id,
+            f"🔎По запросу «{query_text}» не нашлось в архиве, но нашёл на MyInstants "
+            f"и добавил: «{entry['title']}». Уже доступен в поиске:",
+        )
+        await bot.send_voice(requester_id, voice=entry["file_id"])
+    except TelegramAPIError:
+        # Скорее всего, requester_id никогда не писал боту — Telegram не
+        # даёт ботам первыми начинать личный чат. Звук при этом мог уже
+        # успеть опубликоваться и попасть в базу — это не потеря, просто
+        # человек не узнает о находке лично, увидит её в обычном поиске.
+        logger.info(
+            "Не удалось написать пользователю %s о находке по запросу «%s» "
+            "(возможно, он не начинал чат с ботом)",
+            requester_id,
+            query_text,
+        )
+    except Exception:
+        logger.exception("Фоновый поиск на MyInstants упал для запроса «%s»", query_text)
 
 
 async def handle_loads_commands(message: Message) -> None:

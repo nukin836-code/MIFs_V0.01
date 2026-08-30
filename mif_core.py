@@ -27,6 +27,7 @@ import speech_recognition as sr
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import BufferedInputFile
+from rapidfuzz import fuzz
 
 logger = logging.getLogger("mif-bot.core")
 
@@ -177,6 +178,102 @@ def find_duplicate_by_title(title: str) -> dict[str, Any] | None:
         if str(mif.get("title", "")).strip().lower() == title_key:
             return mif
     return None
+
+
+# --- Поиск (точное вхождение + нечёткий рейтинг через rapidfuzz) -----------
+
+# Инлайн-ответ Telegram не может содержать больше 50 результатов — если
+# отдать больше, answerInlineQuery падает с ошибкой. Раньше при пустом или
+# однобуквенном запросе под фильтр попадала вся база (пустой tokens-список
+# ничего не отсеивал), и это тянуло на 50+ при росте базы через /loads.
+MAX_INLINE_RESULTS = 50
+
+# Название/теги, которые ввёл сам человек, весят больше, чем шумное
+# авто-распознавание речи (Google STT нередко ошибается в словах и фоне).
+TITLE_SOURCE_WEIGHT = 1.0
+BOT_DESCRIPTION_SOURCE_WEIGHT = 0.65
+
+# Порог применяется к УЖЕ ВЗВЕШЕННОМУ баллу — значит, чтобы совпадение по
+# одному только bot_description (без поддержки со стороны user_tags) прошло
+# порог, оно должно быть почти точным (0.65 × 100 ≈ 65 — как раз впритык).
+# Это осознанно: раз STT часто ошибается, не даём шумному тексту тянуть на
+# себя нечёткие совпадения так же легко, как проверенным пользовательским
+# тегам.
+FUZZY_MATCH_THRESHOLD = 65.0
+
+
+def fuzzy_match_score(query: str, text: str) -> float:
+    """Простое (без разбивки по источникам и весам) нечёткое сравнение —
+    для сопоставления с ВНЕШНИМИ данными вроде заголовков MyInstants, а не
+    с нашей размеченной локальной базой. Точное вхождение подстроки — сразу
+    100, иначе rapidfuzz.token_set_ratio (не зависит от порядка слов внутри
+    text, терпим к мелким опечаткам)."""
+    query = query.strip().lower()
+    text = text.strip().lower()
+    if not query or not text:
+        return 0.0
+    if query in text:
+        return 100.0
+    return fuzz.token_set_ratio(query, text)
+
+
+def _token_match_score(token: str, text: str) -> float:
+    if not text:
+        return 0.0
+    if token in text:
+        return 100.0
+    return fuzz.token_set_ratio(token, text)
+
+
+def _score_mif_tokens(tokens: list[str], user_tags: str, bot_tags: str) -> float | None:
+    """Взвешенный нечёткий поиск по токенам запроса. Для каждого токена
+    берём лучший ВЗВЕШЕННЫЙ результат среди user_tags и bot_tags. Если хотя
+    бы один токен не дотягивает до FUZZY_MATCH_THRESHOLD — запись не
+    подходит (None), сохраняя поведение "каждое слово должно найтись
+    где-то", просто теперь с нечёткостью вместо жёсткой подстроки. Итоговый
+    рейтинг (для сортировки) — среднее по токенам."""
+    total_weighted = 0.0
+    for token in tokens:
+        weighted = max(
+            _token_match_score(token, user_tags) * TITLE_SOURCE_WEIGHT,
+            _token_match_score(token, bot_tags) * BOT_DESCRIPTION_SOURCE_WEIGHT,
+        )
+        if weighted < FUZZY_MATCH_THRESHOLD:
+            return None
+        total_weighted += weighted
+    return total_weighted / len(tokens)
+
+
+def find_matching_mifs(query_text: str) -> tuple[list[dict[str, Any]], float]:
+    """Ищет по локальной базе. Возвращает (топ-MAX_INLINE_RESULTS по
+    убыванию релевантности, лучший_балл_среди_всех). Лучший балл нужен
+    вызывающему коду (main.py), чтобы решить, стоит ли запускать фоновый
+    поиск на MyInstants — см. mif_loader.background_internet_lookup.
+
+    Пустой запрос: не фильтруем и не сортируем (нечего ранжировать),
+    отдаём первые MAX_INLINE_RESULTS — именно это чинит падение при
+    пустом/однобуквенном запросе, а не "фильтрация в один шаг".
+    """
+    tokens = [token for token in query_text.lower().strip().split() if token]
+
+    if not tokens:
+        # Пустой запрос — не запускаем фоновый интернет-поиск (нечего
+        # искать), поэтому best_score = 100.0, а не 0.0.
+        return list(MIFS_DATABASE[:MAX_INLINE_RESULTS]), 100.0
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for mif in MIFS_DATABASE:
+        user_tags = str(mif.get("user_tags", mif.get("tags", ""))).lower()
+        bot_tags = str(mif.get("bot_tags", mif.get("bot_description", ""))).lower()
+
+        score = _score_mif_tokens(tokens, user_tags, bot_tags)
+        if score is None:
+            continue
+        scored.append((score, mif))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    best_score = scored[0][0] if scored else 0.0
+    return [mif for _, mif in scored[:MAX_INLINE_RESULTS]], best_score
 
 
 # Загружается один раз при первом импорте этого модуля и переиспользуется

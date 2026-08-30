@@ -262,27 +262,14 @@ async def handle_unknown_command(message: Message) -> None:
 
 @dp.inline_query()
 async def search_mifs(query: InlineQuery) -> None:
-    user_input = query.query.lower().strip()
-    # Мульти-поиск: бьём запрос на отдельные слова и требуем, чтобы КАЖДОЕ
-    # слово нашлось где-то в тегах (не важно, в каком порядке и в каком
-    # конкретно поле — пользовательском или авто-описании от бота).
-    tokens = [token for token in user_input.split() if token]
+    matches, best_score = mif_core.find_matching_mifs(query.query)
     results = []
 
-    for mif in mif_core.MIFS_DATABASE:
-        user_tags = str(mif.get("user_tags", mif.get("tags", ""))).lower()
-        bot_tags = str(
-            mif.get("bot_tags", mif.get("bot_description", ""))
-        ).lower()
-        title = str(mif.get("title", mif.get("user_description", "Звук")))
-
-        combined_tags = f"{user_tags} {bot_tags}"
-        if tokens and not all(token in combined_tags for token in tokens):
-            continue
-
+    for mif in matches:
         mif_id = str(mif.get("id", ""))
         file_id = str(mif.get("file_id", ""))
         file_type = mif.get("file_type", mif.get("media_type", "voice"))
+        title = str(mif.get("title", mif.get("user_description", "Звук")))
 
         # Пересылаем чистый звук без подписи, авторства и лишнего текста —
         # ровно то, что просили: файл берётся напрямую из "базы" канала.
@@ -307,6 +294,17 @@ async def search_mifs(query: InlineQuery) -> None:
         cache_time=1,
         is_personal=True,
     )
+
+    # Локальный поиск дал слабое совпадение (или вообще ничего) — пробуем
+    # найти звук на MyInstants в фоне. НЕ делаем это до query.answer() и не
+    # ждём результата здесь: инлайн-ответ Telegram должен прийти быстро, а
+    # скачивание+конвертация+публикация занимают секунды. Если получится —
+    # mif_loader сам пришлёт находку личным сообщением автору запроса.
+    query_text = query.query.strip()
+    if query_text and best_score < mif_core.FUZZY_MATCH_THRESHOLD:
+        asyncio.create_task(
+            mif_loader.background_internet_lookup(query.bot, query.from_user.id, query_text)
+        )
 
 
 async def main() -> None:
