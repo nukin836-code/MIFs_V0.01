@@ -24,7 +24,7 @@ import os
 import re
 import time
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, quote_plus, urljoin
 
 import requests
 from aiogram import Bot
@@ -213,27 +213,62 @@ def parse_page(page_html: str) -> list[dict[str, str]]:
     return sounds
 
 
-_CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
+_CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁіІїЇєЄґҐ]")  # + украинские буквы i/ї/є/ґ, которых нет в русском
+
+MYINSTANTS_SEARCH_URL = f"{MYINSTANTS_BASE_URL}/ru/search/?name={{query}}"
 
 
 def _translate_to_english(query: str) -> str | None:
-    """Если запрос на кириллице — пробуем перевести на английский. Тайтлы
-    на MyInstants почти все английские, и нечёткое посимвольное сравнение
-    русской фразы с ними физически не может дать высокий балл (нет общих
-    букв) — так что без перевода поиск по-русски был обречён давать 0
-    независимо ни от какой блокировки. При любой ошибке перевода просто
-    возвращаем None — вызывающий код тогда работает только с оригиналом
-    (для нерусских запросов это и есть обычный путь)."""
+    """Если запрос на кириллице (русской ИЛИ украинской — не важно, какой
+    именно, определяем сам факт кириллицы) — пробуем перевести на
+    английский. source="auto" сам определит язык, не нужно гадать
+    заранее — так это работает и для русского, и для украинского, и для
+    чего угодно ещё. Тайтлы на MyInstants почти все английские, и нечёткое
+    посимвольное сравнение кириллической фразы с ними физически не может
+    дать высокий балл без перевода (нет общих букв). При любой ошибке
+    перевода просто возвращаем None — вызывающий код тогда работает только
+    с оригиналом."""
     if not _CYRILLIC_RE.search(query):
         return None
     try:
         from deep_translator import GoogleTranslator
 
-        translated = GoogleTranslator(source="ru", target="en").translate(query)
-        return translated.strip() if translated else None
-    except Exception:
-        logger.warning("Не удалось перевести запрос «%s» на английский", query)
+        translated = GoogleTranslator(source="auto", target="en").translate(query)
+        if translated:
+            logger.info("Перевёл запрос «%s» → «%s»", query, translated)
+            return translated.strip()
         return None
+    except Exception:
+        logger.warning("Не удалось перевести запрос «%s» на английский", query, exc_info=True)
+        return None
+
+
+async def _fetch_site_search(session: requests.Session, query: str) -> list[dict[str, str]]:
+    """Официальный поиск сайта: /ru/search/?name=. Путь /ru/ подтверждённо
+    жив (в отличие от /en/search/, который отвечает 404) — но не проверено
+    на 100%, действительно ли параметр name фильтрует результат на стороне
+    сайта. Поэтому это не единственный источник в search_catalog: что бы
+    сюда ни вернулось, оно всё равно проходит через тот же fuzzy-скоринг,
+    что и результаты обхода категорий — нерелевантное просто отсеется
+    порогом ниже."""
+    url = MYINSTANTS_SEARCH_URL.format(query=quote_plus(query))
+    try:
+        page_html = await asyncio.to_thread(fetch_page, session, url)
+    except requests.HTTPError as error:
+        status = error.response.status_code if error.response is not None else None
+        logger.info("Поиск сайта для «%s»: HTTP %s, пропускаю этот источник", query, status)
+        return []
+    except requests.RequestException:
+        logger.warning("Поиск сайта для «%s» не удался сетевой ошибкой", query, exc_info=True)
+        return []
+
+    sounds = parse_page(page_html)
+    logger.info(
+        "Поиск сайта для «%s»: получено %d записей (до фильтрации по релевантности)",
+        query,
+        len(sounds),
+    )
+    return sounds
 
 
 async def search_catalog(
@@ -243,63 +278,88 @@ async def search_catalog(
     max_results: int = 10,
     min_score: float = mif_core.FUZZY_MATCH_THRESHOLD,
 ) -> list[tuple[float, dict[str, str]]]:
-    """Раз у сайта больше нет рабочего поиска по произвольному тексту —
-    ищем сами: проходим по первым SEARCH_PAGES_PER_CATEGORY страницам
-    каждой категории, собираем названия и нечётко сравниваем их с query
-    (и, если запрос на кириллице, с его английским переводом — берём
-    лучший балл из двух) через mif_core.fuzzy_match_score.
+    """Ищет звук по произвольному тексту в два этапа:
+
+    1. Официальный поиск сайта (/ru/search/?name=) — для оригинального
+       запроса и, если он на кириллице, для его английского перевода.
+       Быстро (1-2 запроса), но неизвестно точно, фильтрует ли сайт
+       результат по name или отдаёт что-то общее — поэтому дальше всё
+       равно идёт через fuzzy-скоринг, а не доверяется вслепую.
+    2. Если этап 1 не дал ни одного совпадения выше min_score — резервный
+       обход первых SEARCH_PAGES_PER_CATEGORY страниц каждой категории
+       (медленнее, секунд 5-15, но точно рабочий путь, проверенный
+       напрямую).
 
     Возвращает до max_results пар (балл, звук) с баллом >= min_score,
     отсортированных по убыванию релевантности. min_score решает вызывающий
-    код, а не эта функция — у /loadsSearch (человек явно попросил, можно
-    честно показать "точного нет, но вот ближайшее") и у
-    background_internet_lookup (публикует в общий канал сам, без человека)
-    разные требования к строгости. По умолчанию — строгий
-    mif_core.FUZZY_MATCH_THRESHOLD; для best-effort передай
-    mif_core.FUZZY_MATCH_FLOOR или 0.
+    код: у /loadsSearch (человек явно попросил, можно честно показать
+    "точного нет, но вот ближайшее") и у background_internet_lookup
+    (публикует в общий канал сам, без человека) разные требования к
+    строгости — по умолчанию строгий mif_core.FUZZY_MATCH_THRESHOLD, для
+    best-effort передай mif_core.FUZZY_MATCH_FLOOR.
 
-    Это ~14 HTTP-запросов подряд (по одному на категорию) — секунд 5-15.
-    Приемлемо для команды типа /loadsSearch (не инлайн-запрос, Telegram не
-    ограничивает время ответа на обычное сообщение), но не для чего-то,
-    что должно быть мгновенным.
-
-    Кидает CatalogBlockedError, если сайт явно отвечает 403 (не "страницы
-    нет", а "в доступе отказано") — вызывающий код может отличить это от
-    прочих сетевых сбоев и сказать пользователю что-то более осмысленное.
+    Кидает CatalogBlockedError, если категории (резервный этап) явно
+    отвечают 403 (не "страницы нет", а "в доступе отказано").
     """
     translated = await asyncio.to_thread(_translate_to_english, query)
     query_variants = [query] + ([translated] if translated else [])
+    logger.info("Поиск на MyInstants: запрос=%r, варианты для сравнения=%r", query, query_variants)
 
+    seen_urls: set[str] = set()
     candidates: list[tuple[float, dict[str, str]]] = []
 
-    for category in MYINSTANTS_CATEGORIES:
-        for page in range(1, SEARCH_PAGES_PER_CATEGORY + 1):
-            url = _category_url(category, page)
-            try:
-                page_html = await asyncio.to_thread(fetch_page, session, url)
-                sounds = parse_page(page_html)
-            except requests.HTTPError as error:
-                status = error.response.status_code if error.response is not None else None
-                if status in {404, 410}:
-                    break
-                if status == 403:
-                    raise CatalogBlockedError(
-                        f"MyInstants ответил 403 на категории «{category}» — "
-                        "похоже на блокировку доступа"
-                    ) from error
-                raise
-            if not sounds:
-                break
+    def consider(sound: dict[str, str]) -> None:
+        if sound["url"] in seen_urls:
+            return
+        seen_urls.add(sound["url"])
+        best_score = max(
+            mif_core.fuzzy_match_score(variant, sound["title"]) for variant in query_variants
+        )
+        if best_score >= min_score:
+            candidates.append((best_score, sound))
 
-            for sound in sounds:
-                best_score = max(
-                    mif_core.fuzzy_match_score(variant, sound["title"])
-                    for variant in query_variants
-                )
-                if best_score >= min_score:
-                    candidates.append((best_score, sound))
+    # Этап 1: поиск сайта, для каждого варианта запроса.
+    for variant in query_variants:
+        for sound in await _fetch_site_search(session, variant):
+            consider(sound)
+
+    # Этап 2 (резерв): обход категорий — только если поиск сайта не дал
+    # ничего выше порога.
+    if not candidates:
+        logger.info(
+            "Поиск сайта не дал совпадений ≥%.0f для «%s», сканирую категории",
+            min_score,
+            query,
+        )
+        for category in MYINSTANTS_CATEGORIES:
+            for page in range(1, SEARCH_PAGES_PER_CATEGORY + 1):
+                url = _category_url(category, page)
+                try:
+                    page_html = await asyncio.to_thread(fetch_page, session, url)
+                    sounds = parse_page(page_html)
+                except requests.HTTPError as error:
+                    status = error.response.status_code if error.response is not None else None
+                    if status in {404, 410}:
+                        break
+                    if status == 403:
+                        raise CatalogBlockedError(
+                            f"MyInstants ответил 403 на категории «{category}» — "
+                            "похоже на блокировку доступа"
+                        ) from error
+                    raise
+                if not sounds:
+                    break
+                for sound in sounds:
+                    consider(sound)
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
+    logger.info(
+        "Поиск на MyInstants для «%s»: итог %d кандидатов ≥%.0f баллов (лучший: %s)",
+        query,
+        len(candidates),
+        min_score,
+        f"{candidates[0][0]:.0f} «{candidates[0][1]['title']}»" if candidates else "нет",
+    )
     return candidates[:max_results]
 
 
@@ -465,10 +525,6 @@ async def main() -> None:
                     logger.exception("Не удалось загрузить страницу: %s", page_url)
                     pager.advance_category()
                     continue
-                except requests.RequestException:
-                    logger.exception("Не удалось загрузить страницу: %s", page_url)
-                    pager.advance_category()
-                    continue
 
                 logger.info(
                     "Категория «%s», страница: найдено звуков=%s",
@@ -502,4 +558,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
