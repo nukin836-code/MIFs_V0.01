@@ -3038,20 +3038,5 @@
     "channel_message_id": 294,
     "content_hash": "4fb50a470981d5cc99ac63707bf8441445f90855a4f1ed03eea109e768f76411",
     "source_url": "https://www.myinstants.com/media/sounds/sonic-spring.mp3"
-  },
-  {
-    "id": "208",
-    "title": "Fnaf 1 music box",
-    "file_id": "AwACAgIAAyEGAAMBAAHYslQAAgEnapP-z9TjrZQC2vk7cXYPRHUuICYAAk6dAAJ31aBIh4P-iwRXoD09BA",
-    "file_type": "voice",
-    "media_type": "voice",
-    "user_description": "Fnaf 1 music box",
-    "bot_description": "",
-    "user_tags": "fnaf 1 music box",
-    "bot_tags": "",
-    "tags": "fnaf 1 music box",
-    "channel_message_id": 295,
-    "content_hash": "dd8211e2fb50a2583169a917e5d8140406f76c992f58aac2c51e7bcf5aeff49b",
-    "source_url": "https://www.myinstants.com/media/sounds/fnaf-1-music-box.mp3"
   }
 ]

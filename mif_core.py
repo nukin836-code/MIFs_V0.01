@@ -203,14 +203,18 @@ FUZZY_MATCH_THRESHOLD = 65.0
 
 
 def fuzzy_match_score(query: str, text: str) -> float:
-    """Сравнение с ВНЕШНИМИ данными (MyInstants).
-    Нечёткая фильтрация для сайта отключена: если MyInstants
-    выдал результат, считаем его 100% подходящим (100.0),
-    чтобы бот не отбраковывал выдачу.
-    """
-    if not query.strip() or not text.strip():
+    """Простое (без разбивки по источникам и весам) нечёткое сравнение —
+    для сопоставления с ВНЕШНИМИ данными вроде заголовков MyInstants, а не
+    с нашей размеченной локальной базой. Точное вхождение подстроки — сразу
+    100, иначе rapidfuzz.token_set_ratio (не зависит от порядка слов внутри
+    text, терпим к мелким опечаткам)."""
+    query = query.strip().lower()
+    text = text.strip().lower()
+    if not query or not text:
         return 0.0
-    return 100.0
+    if query in text:
+        return 100.0
+    return fuzz.token_set_ratio(query, text)
 
 
 def _token_match_score(token: str, text: str) -> float:
@@ -538,28 +542,36 @@ async def publish_voice_mif(
 
     resolved_file_id = sent_message.voice.file_id
     final_caption = f"{base_caption}\n<b>file_id:</b> <code>{html.escape(resolved_file_id)}</code>"
-
-    await _call_with_flood_retry(
-        lambda: bot.edit_message_caption(
-            chat_id=CHANNEL_ID,
-            message_id=sent_message.message_id,
-            caption=final_caption,
-            parse_mode="HTML",
+    try:
+        await _call_with_flood_retry(
+            lambda: bot.edit_message_caption(
+                chat_id=CHANNEL_ID,
+                message_id=sent_message.message_id,
+                caption=final_caption,
+                parse_mode="HTML",
+            )
         )
-    )
+    except TelegramAPIError:
+        # Кэш всё равно содержит правильный ID. Если подпись не удалось
+        # изменить, reconcile_channel.py восстановит её через copy_message.
+        logger.exception(
+            "Не удалось дописать фактический file_id в подпись поста %s",
+            sent_message.message_id,
+        )
 
-    new_mif = {
+    new_mif: dict[str, Any] = {
         "id": next_mif_id(),
         "title": title,
         "file_id": resolved_file_id,
-        "tags": tags_text,
-        "media_type": "voice",
         "file_type": "voice",
-        "user_tags": tags_text,
-        "bot_tags": bot_description,
+        "media_type": "voice",
+        "user_description": title,
         "bot_description": bot_description,
-        "content_hash": content_hash,
+        "user_tags": tags_text.lower(),
+        "bot_tags": bot_description.lower(),
+        "tags": tags_text.lower(),
         "channel_message_id": sent_message.message_id,
+        "content_hash": content_hash,
     }
     if source_url:
         new_mif["source_url"] = source_url
@@ -569,4 +581,11 @@ async def publish_voice_mif(
     MIFS_DATABASE.append(new_mif)
     save_mifs()
     return new_mif
-  
+
+
+async def report_bug(bot: Bot, text: str) -> None:
+    """Шлёт короткое сообщение об ошибке в группу для баг-репортов."""
+    try:
+        await bot.send_message(chat_id=int(BUG_REPORT_CHAT_ID), text=clip_text(text, 3500))
+    except (TelegramAPIError, ValueError):
+        logger.exception("Не удалось отправить баг-репорт в группу")
