@@ -6,6 +6,12 @@ MyInstants). Если тебе нужно поменять ЧТО происхо
 правь mif_core.py, а не этот файл.
 """
 
+/ Fastify
+app.get('/', (req, res) => {
+  res.send({ status: 'ok', message: 'API Server is running' });
+});
+
+
 import asyncio
 import html
 import logging
