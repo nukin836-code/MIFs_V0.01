@@ -207,7 +207,7 @@ FUZZY_MATCH_THRESHOLD = 65.0
 # "не нашёл"). НЕ используется для автопубликации без участия человека
 # (background_internet_lookup) — там мусор ниже FUZZY_MATCH_THRESHOLD в
 # общий канал лучше не пускать.
-FUZZY_MATCH_FLOOR = 30.0
+FUZZY_MATCH_FLOOR = 45.0
 
 
 def fuzzy_match_score(query: str, text: str) -> float:
@@ -257,6 +257,7 @@ def find_matching_mifs(query_text: str) -> tuple[list[dict[str, Any]], float]:
     убыванию релевантности, лучший_балл_среди_всех). Лучший балл нужен
     вызывающему коду (main.py), чтобы решить, стоит ли запускать фоновый
     поиск на MyInstants — см. mif_loader.background_internet_lookup.
+
     Пустой запрос: не фильтруем и не сортируем (нечего ранжировать),
     отдаём первые MAX_INLINE_RESULTS — именно это чинит падение при
     пустом/однобуквенном запросе, а не "фильтрация в один шаг".
@@ -421,8 +422,7 @@ async def analyze_and_convert(
             await convert_to_ogg_voice(source_path, ogg_path)
         except (OSError, RuntimeError) as error:
             logger.exception("Не удалось перегнать аудио в Opus/OGG")
-            raise RuntimeError(
-                "Не удалось перегнать аудио в формат голосового сообщения (Opus/OGG)."
+            raise RuntimeError("Не удалось перегнать аудио в формат голосового сообщения (Opus/OGG)."
             ) from error
         ogg_bytes = ogg_path.read_bytes()
 

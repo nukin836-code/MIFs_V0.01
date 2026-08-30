@@ -218,6 +218,16 @@ _CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁіІїЇєЄґҐ]")  # + украин
 
 MYINSTANTS_SEARCH_URL = f"{MYINSTANTS_BASE_URL}/ru/search/?name={{query}}"
 
+# Проверено напрямую: это настоящий JSON API (эндпоинт мобильного
+# приложения сайта — у MyInstants есть app в Google Play), возвращает
+# структурированные данные {"count":.., "results":[{"name":.., "sound":..,
+# "slug":..}]}. Надёжнее HTML-скрейпинга — нет парсинга разметки, нет
+# зависимости от того, не поменяли ли на сайте класс div. Теперь это
+# первая стратегия в search_catalog; HTML-поиск и обход категорий остаются
+# резервом на случай, если у API не окажется чего-то, что видно на сайте
+# напрямую.
+MYINSTANTS_API_URL = f"{MYINSTANTS_BASE_URL}/api/v1/instants/"
+
 
 def _translate_to_english(query: str) -> str | None:
     """Если запрос на кириллице (русской ИЛИ украинской — не важно, какой
@@ -244,23 +254,88 @@ def _translate_to_english(query: str) -> str | None:
         return None
 
 
+def _parse_api_payload(payload: Any, query: str) -> list[dict[str, str]]:
+    """Разбирает ответ JSON API в тот же формат {"title":.., "url":..}, что
+    и HTML-парсер parse_page — вызывающему коду не важно, откуда пришли
+    данные. Максимально защищено: сервер может прислать не совсем то, что
+    ожидается (другая структура, отсутствующие поля) — на любой такой
+    случай просто пропускаем конкретный элемент или возвращаем пустой
+    список, а не падаем с KeyError/TypeError где-то в середине пайплайна."""
+    if not isinstance(payload, dict):
+        logger.warning("API вернул не JSON-объект для «%s»: %r", query, type(payload))
+        return []
+
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list):
+        logger.warning("В ответе API для «%s» нет списка results", query)
+        return []
+
+    sounds: list[dict[str, str]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("name")
+        mp3_url = item.get("sound")
+        # Без названия или прямой ссылки на файл запись бесполезна дальше
+        # по пайплайну (download_audio получит пустую строку и упадёт на
+        # ровном месте) — пропускаем такие записи сразу здесь.
+        if not title or not mp3_url:
+            continue
+        sounds.append({"title": str(title), "url": str(mp3_url)})
+
+    return sounds
+
+
+def _fetch_api_search_sync(session: requests.Session, query: str) -> list[dict[str, str]]:
+    """Синхронная часть похода в JSON API (вызывается через
+    asyncio.to_thread, как и весь остальной requests-код в этом файле —
+    сознательно не завожу здесь aiohttp вторым HTTP-стеком параллельно с
+    requests, это лишняя сложность без реальной пользы)."""
+    url = f"{MYINSTANTS_API_URL}?name={quote_plus(query)}&format=json"
+    try:
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        logger.warning("API-поиск для «%s»: сетевая ошибка", query, exc_info=True)
+        return []
+
+    if response.status_code != 200:
+        logger.info("API-поиск для «%s»: HTTP %s, пропускаю этот источник", query, response.status_code)
+        return []
+
+    try:
+        payload = response.json()
+    except ValueError:
+        logger.warning(
+            "API-поиск для «%s»: ответ не распарсился как JSON (content-type=%r)",
+            query,
+            response.headers.get("content-type"),
+        )
+        return []
+
+    sounds = _parse_api_payload(payload, query)
+    logger.info("API-поиск для «%s»: получено %d записей", query, len(sounds))
+    return sounds
+
+
+async def _fetch_api_search(session: requests.Session, query: str) -> list[dict[str, str]]:
+    return await asyncio.to_thread(_fetch_api_search_sync, session, query)
+
+
 async def _fetch_site_search(session: requests.Session, query: str) -> list[dict[str, str]]:
-    """Официальный поиск сайта: /ru/search/?name=. Путь /ru/ подтверждённо
-    жив (в отличие от /en/search/, который отвечает 404) — но не проверено
-    на 100%, действительно ли параметр name фильтрует результат на стороне
-    сайта. Поэтому это не единственный источник в search_catalog: что бы
-    сюда ни вернулось, оно всё равно проходит через тот же fuzzy-скоринг,
-    что и результаты обхода категорий — нерелевантное просто отсеется
-    порогом ниже."""
+    """Резерв №1 (если API ничего не дал): HTML-поиск сайта /ru/search/.
+    Путь подтверждённо жив (в отличие от /en/search/, который отвечает
+    404), но не проверено на 100%, фильтрует ли параметр name на стороне
+    сайта. Поэтому дальше всё равно идёт через тот же fuzzy-скоринг, что и
+    everything else — нерелевантное отсеется порогом."""
     url = MYINSTANTS_SEARCH_URL.format(query=quote_plus(query))
     try:
         page_html = await asyncio.to_thread(fetch_page, session, url)
     except requests.HTTPError as error:
         status = error.response.status_code if error.response is not None else None
-        logger.info("Поиск сайта для «%s»: HTTP %s, пропускаю этот источник", query, status)
+        logger.info("HTML-поиск сайта для «%s»: HTTP %s, пропускаю этот источник", query, status)
         return []
     except requests.RequestException:
-        logger.warning("Поиск сайта для «%s» не удался сетевой ошибкой", query, exc_info=True)
+        logger.warning("HTML-поиск сайта для «%s» не удался сетевой ошибкой", query, exc_info=True)
         return []
 
     sounds = parse_page(page_html)
@@ -279,17 +354,25 @@ async def search_catalog(
     max_results: int = 10,
     min_score: float = mif_core.FUZZY_MATCH_THRESHOLD,
 ) -> list[tuple[float, dict[str, str]]]:
-    """Ищет звук по произвольному тексту в два этапа:
+    """Ищет звук по произвольному тексту в три каскадных этапа, каждый
+    следующий запускается только если предыдущий не дал ни одного
+    совпадения ≥ min_score:
 
-    1. Официальный поиск сайта (/ru/search/?name=) — для оригинального
-       запроса и, если он на кириллице, для его английского перевода.
-       Быстро (1-2 запроса), но неизвестно точно, фильтрует ли сайт
-       результат по name или отдаёт что-то общее — поэтому дальше всё
-       равно идёт через fuzzy-скоринг, а не доверяется вслепую.
-    2. Если этап 1 не дал ни одного совпадения выше min_score — резервный
-       обход первых SEARCH_PAGES_PER_CATEGORY страниц каждой категории
-       (медленнее, секунд 5-15, но точно рабочий путь, проверенный
-       напрямую).
+    1. JSON API (/api/v1/instants/?name=) — структурированные данные,
+       официальный эндпоинт мобильного приложения сайта. Самый быстрый и
+       надёжный источник, пробуется первым.
+    2. HTML-поиск сайта (/ru/search/?name=) — подтверждённо живой путь
+       (в отличие от /en/search/, отвечающего 404), но не проверено на
+       100%, фильтрует ли он на стороне сайта.
+    3. Обход первых SEARCH_PAGES_PER_CATEGORY страниц каждой категории —
+       медленнее (секунд 5-15), но точно рабочий путь, проверенный
+       напрямую, финальный резерв.
+
+    На каждом этапе пробуются оба варианта запроса — оригинал и, если он
+    на кириллице, английский перевод. Что бы ни вернул любой из трёх
+    источников, оно всё равно проходит через один и тот же fuzzy-скоринг
+    (mif_core.fuzzy_match_score) — нерелевантное отсеивается порогом
+    независимо от того, насколько мы доверяем фильтрации на стороне сайта.
 
     Возвращает до max_results пар (балл, звук) с баллом >= min_score,
     отсортированных по убыванию релевантности. min_score решает вызывающий
@@ -299,8 +382,8 @@ async def search_catalog(
     строгости — по умолчанию строгий mif_core.FUZZY_MATCH_THRESHOLD, для
     best-effort передай mif_core.FUZZY_MATCH_FLOOR.
 
-    Кидает CatalogBlockedError, если категории (резервный этап) явно
-    отвечают 403 (не "страницы нет", а "в доступе отказано").
+    Кидает CatalogBlockedError, если категории (этап 3) явно отвечают 403
+    (не "страницы нет", а "в доступе отказано").
     """
     translated = await asyncio.to_thread(_translate_to_english, query)
     query_variants = [query] + ([translated] if translated else [])
@@ -319,16 +402,23 @@ async def search_catalog(
         if best_score >= min_score:
             candidates.append((best_score, sound))
 
-    # Этап 1: поиск сайта, для каждого варианта запроса.
+    # Этап 1: JSON API.
     for variant in query_variants:
-        for sound in await _fetch_site_search(session, variant):
+        for sound in await _fetch_api_search(session, variant):
             consider(sound)
 
-    # Этап 2 (резерв): обход категорий — только если поиск сайта не дал
-    # ничего выше порога.
+    # Этап 2 (резерв): HTML-поиск сайта — только если API не дал ничего
+    # выше порога.
+    if not candidates:
+        logger.info("API не дал совпадений ≥%.0f для «%s», пробую HTML-поиск сайта", min_score, query)
+        for variant in query_variants:
+            for sound in await _fetch_site_search(session, variant):
+                consider(sound)
+
+    # Этап 3 (финальный резерв): обход категорий.
     if not candidates:
         logger.info(
-            "Поиск сайта не дал совпадений ≥%.0f для «%s», сканирую категории",
+            "HTML-поиск тоже не дал совпадений ≥%.0f для «%s», сканирую категории",
             min_score,
             query,
         )
@@ -511,7 +601,7 @@ async def main() -> None:
         async with Bot(token=BOT_TOKEN) as bot:
             # Обходим все категории по кругу. Останавливаемся сами, если
             # прошли полный круг категорий и нигде не нашли ничего нового —
-                        # иначе это будет буквально бесконечный процесс, что для
+            # иначе это будет буквально бесконечный процесс, что для
             # ручного batch-запуска (в отличие от /loads в самом боте)
             # неожиданно.
             while categories_without_new_content_in_a_row < len(MYINSTANTS_CATEGORIES):
