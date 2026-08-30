@@ -376,11 +376,22 @@ async def search_catalog(
 
     Возвращает до max_results пар (балл, звук) с баллом >= min_score,
     отсортированных по убыванию релевантности. min_score решает вызывающий
-    код: у /loadsSearch (человек явно попросил, можно честно показать
-    "точного нет, но вот ближайшее") и у background_internet_lookup
-    (публикует в общий канал сам, без человека) разные требования к
-    строгости — по умолчанию строгий mif_core.FUZZY_MATCH_THRESHOLD, для
-    best-effort передай mif_core.FUZZY_MATCH_FLOOR.
+    код для этапов 1-2 (настоящий поиск сайта — там есть хоть какая-то
+    осмысленность в том, что вернулось): у /loadsSearch (человек явно
+    попросил, можно честно показать "точного нет, но вот ближайшее") и у
+    background_internet_lookup (публикует в общий канал сам) разные
+    требования к строгости — по умолчанию строгий
+    mif_core.FUZZY_MATCH_THRESHOLD, для best-effort передай
+    mif_core.FUZZY_MATCH_FLOOR.
+
+    ВАЖНО: этап 3 (обход категорий) ВСЕГДА требует как минимум
+    mif_core.FUZZY_MATCH_THRESHOLD, даже если вызывающий код просил более
+    низкий min_score. Проверено на практике: категории — это "всё, что там
+    лежит", без всякой фильтрации от сайта, и на таком большом
+    неотфильтрованном пуле слабый порог начинает случайно цеплять
+    что-то просто по совпадающим буквам без всякой связи по смыслу
+    (например, "лох пидр" и "мем человек паук" — совершенно разные
+    фразы — оба цепляли одно и то же случайное "Error SOUNDSS").
 
     Кидает CatalogBlockedError, если категории (этап 3) явно отвечают 403
     (не "страницы нет", а "в доступе отказано").
@@ -392,20 +403,20 @@ async def search_catalog(
     seen_urls: set[str] = set()
     candidates: list[tuple[float, dict[str, str]]] = []
 
-    def consider(sound: dict[str, str]) -> None:
+    def consider(sound: dict[str, str], stage_min_score: float) -> None:
         if sound["url"] in seen_urls:
             return
         seen_urls.add(sound["url"])
         best_score = max(
             mif_core.fuzzy_match_score(variant, sound["title"]) for variant in query_variants
         )
-        if best_score >= min_score:
+        if best_score >= stage_min_score:
             candidates.append((best_score, sound))
 
     # Этап 1: JSON API.
     for variant in query_variants:
         for sound in await _fetch_api_search(session, variant):
-            consider(sound)
+            consider(sound, min_score)
 
     # Этап 2 (резерв): HTML-поиск сайта — только если API не дал ничего
     # выше порога.
@@ -413,14 +424,18 @@ async def search_catalog(
         logger.info("API не дал совпадений ≥%.0f для «%s», пробую HTML-поиск сайта", min_score, query)
         for variant in query_variants:
             for sound in await _fetch_site_search(session, variant):
-                consider(sound)
+                consider(sound, min_score)
 
-    # Этап 3 (финальный резерв): обход категорий.
+    # Этап 3 (финальный резерв): обход категорий. Строгий порог всегда,
+    # см. предупреждение в докстринге выше.
     if not candidates:
+        category_scan_min_score = max(min_score, mif_core.FUZZY_MATCH_THRESHOLD)
         logger.info(
-            "HTML-поиск тоже не дал совпадений ≥%.0f для «%s», сканирую категории",
+            "HTML-поиск тоже не дал совпадений ≥%.0f для «%s», сканирую категории "
+            "(порог для этого этапа: ≥%.0f)",
             min_score,
             query,
+            category_scan_min_score,
         )
         for category in MYINSTANTS_CATEGORIES:
             for page in range(1, SEARCH_PAGES_PER_CATEGORY + 1):
@@ -441,7 +456,7 @@ async def search_catalog(
                 if not sounds:
                     break
                 for sound in sounds:
-                    consider(sound)
+                    consider(sound, category_scan_min_score)
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
     logger.info(
@@ -479,7 +494,7 @@ def download_audio(session: requests.Session, url: str) -> bytes:
     # raise_for_status() пропускает 200 OK — а капча/блок-страница Cloudflare
     # обычно ПРИХОДИТ именно с кодом 200, просто с HTML вместо файла.
     # Проверяем первые байты содержимого — надёжнее, чем гадать по невнятной
-    # ошибке ffmpeg или DOCUMENT_INVALID от Telegram тремя шагами позже.
+    ошибке ffmpeg или DOCUMENT_INVALID от Telegram тремя шагами позже.
     head = audio_bytes[:512].lstrip().lower()
     if head.startswith((b"<!doctype", b"<html", b"<?xml")) or b"<head" in head[:200]:
         raise NotAudioContentError(content_type, audio_bytes[:200])

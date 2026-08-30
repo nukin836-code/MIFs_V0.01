@@ -3848,5 +3848,20 @@
     "channel_message_id": 372,
     "content_hash": "6c028d007acae411df5878f1ddd3d0705dc140248c38a247e62004f675b57566",
     "source_url": "https://www.myinstants.com/media/sounds/metal04gr-converted.mp3"
+  },
+  {
+    "id": "262",
+    "title": "Это же мой гриб я его ем",
+    "file_id": "AwACAgIAAyEGAAMBAAHYslQAAgF2apRwxYGR67PExFo8izpzKReZ4_YAArOqAAJ31ahIxVLv_MNYYsY9BA",
+    "file_type": "voice",
+    "media_type": "voice",
+    "user_description": "Это же мой гриб я его ем",
+    "bot_description": "что вы мой гриб снимаете это же мой гриб Ну я его ем Видишь надкушенное я его каждый день по кусочку Что ты делаешь",
+    "user_tags": "это же мой гриб я его ем",
+    "bot_tags": "что вы мой гриб снимаете это же мой гриб ну я его ем видишь надкушенное я его каждый день по кусочку что ты делаешь",
+    "tags": "это же мой гриб я его ем",
+    "channel_message_id": 374,
+    "content_hash": "be22c74e9602c7f60e51d83f0523504743b29bc6c62c57eef2b34e8c4a89da36",
+    "source_url": "https://www.myinstants.com/media/sounds/eto-zhe-moi-grib-ia-ego-em.mp3"
   }
 ]

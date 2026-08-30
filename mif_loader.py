@@ -257,11 +257,13 @@ async def handle_loads_search(message: Message, query: str) -> None:
         await message.answer('Укажи запрос: /loadsSearch "текст".')
         return
 
-    # У сайта больше нет рабочего поиска по произвольному тексту (см.
-    # комментарий над MYINSTANTS_CATEGORIES в import_myinstants.py) — сканим
-    # категории сами, это занимает секунд 5-15, поэтому сразу отвечаем, что
-    # не зависли.
-    await message.answer("🔍Ищу на MyInstants, это может занять до ~15 секунд...")
+    # Раньше почти всегда срабатывал медленный обход категорий (5-15 сек),
+    # теперь в норме отвечает JSON API за секунду-две — обход категорий
+    # остаётся редким финальным резервом, а не обычным путём. Отдельное
+    # "подожди, это долго" сообщение больше не нужно как правило; если
+    # запрос всё же провалится до медленного резерва, это будет видно по
+    # тому, что ответ просто придёт не сразу.
+    await message.answer("🔍Ищу на MyInstants...")
 
     session = requests.Session()
     session.headers.update(importer.MYINSTANTS_HEADERS)
@@ -269,7 +271,9 @@ async def handle_loads_search(message: Message, query: str) -> None:
     try:
         # FUZZY_MATCH_FLOOR, а не строгий FUZZY_MATCH_THRESHOLD: человек сам
         # попросил найти именно это, так что лучше честно показать ближайшую
-        # находку, чем молчать при отсутствии идеального совпадения.
+        # находку, чем молчать при отсутствии идеального совпадения. Обход
+        # категорий внутри search_catalog всё равно всегда использует
+        # строгий порог независимо от этого — см. докстринг search_catalog.
         candidates = await importer.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR)
     except importer.CatalogBlockedError:
         logger.exception("MyInstants заблокировал доступ при поиске: %s", query)

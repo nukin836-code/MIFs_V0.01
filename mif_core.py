@@ -202,12 +202,16 @@ BOT_DESCRIPTION_SOURCE_WEIGHT = 0.65
 FUZZY_MATCH_THRESHOLD = 65.0
 
 # Более низкая планка — "хоть что-то похожее", а не "уверенное совпадение".
-# Используется только для /loadsSearch (человек явно попросил и сам увидит,
-# что нашлось — можно показать честную ближайшую находку вместо пустого
-# "не нашёл"). НЕ используется для автопубликации без участия человека
-# (background_internet_lookup) — там мусор ниже FUZZY_MATCH_THRESHOLD в
-# общий канал лучше не пускать.
-FUZZY_MATCH_FLOOR = 45.0
+# Используется только для /loadsSearch, и ТОЛЬКО для результатов настоящего
+# поиска сайта (API/HTML) — см. import_myinstants.search_catalog. Обход
+# категорий (когда сайт вообще ничего не нашёл) всегда требует
+# FUZZY_MATCH_THRESHOLD, даже в best-effort режиме: там нет фильтрации от
+# сайта вообще, просто "всё, что лежит в категории", и слабый порог на
+# таком большом неотфильтрованном пуле начинает случайно цеплять что-то
+# просто по совпадающим буквам, без всякой связи по смыслу (проверено на
+# практике — "лох пидр" и "мем человек паук" оба цеплялись за одно и то же
+# случайное "Error SOUNDSS").
+FUZZY_MATCH_FLOOR = 60.0
 
 
 def fuzzy_match_score(query: str, text: str) -> float:
@@ -422,7 +426,8 @@ async def analyze_and_convert(
             await convert_to_ogg_voice(source_path, ogg_path)
         except (OSError, RuntimeError) as error:
             logger.exception("Не удалось перегнать аудио в Opus/OGG")
-            raise RuntimeError("Не удалось перегнать аудио в формат голосового сообщения (Opus/OGG)."
+            raise RuntimeError(
+                "Не удалось перегнать аудио в формат голосового сообщения (Opus/OGG)."
             ) from error
         ogg_bytes = ogg_path.read_bytes()
 
