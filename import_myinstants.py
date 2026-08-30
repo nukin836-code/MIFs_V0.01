@@ -494,7 +494,7 @@ def download_audio(session: requests.Session, url: str) -> bytes:
     # raise_for_status() пропускает 200 OK — а капча/блок-страница Cloudflare
     # обычно ПРИХОДИТ именно с кодом 200, просто с HTML вместо файла.
     # Проверяем первые байты содержимого — надёжнее, чем гадать по невнятной
-    ошибке ffmpeg или DOCUMENT_INVALID от Telegram тремя шагами позже.
+    # ошибке ffmpeg или DOCUMENT_INVALID от Telegram тремя шагами позже.
     head = audio_bytes[:512].lstrip().lower()
     if head.startswith((b"<!doctype", b"<html", b"<?xml")) or b"<head" in head[:200]:
         raise NotAudioContentError(content_type, audio_bytes[:200])
@@ -574,7 +574,7 @@ async def import_sound(
             error.content_type,
             sound["url"],
         )
-    except requests.RequestException:
+        cept requests.RequestException:
         logger.exception("Не удалось скачать звук: %s", title)
     except TelegramAPIError:
         logger.exception("Telegram не принял звук для канала %s: %s", mif_core.CHANNEL_ID, title)
