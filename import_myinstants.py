@@ -96,6 +96,25 @@ class AudioTooLargeError(Exception):
     pass
 
 
+class NotAudioContentError(Exception):
+    """Сайт вернул не аудио — скорее всего HTML-страницу (капча/блокировка
+    Cloudflare, либо просто страница ошибки), но с кодом 200, так что
+    raise_for_status() это не ловит. Проверяем содержимое сами."""
+
+    def __init__(self, content_type: str, preview: bytes) -> None:
+        self.content_type = content_type
+        self.preview = preview
+        super().__init__(
+            f"ожидался аудиофайл, получено content-type={content_type!r}, "
+            f"начало ответа: {preview[:120]!r}"
+        )
+
+
+class CatalogBlockedError(Exception):
+    """MyInstants ответил 403 — явный сигнал блокировки (не 404 "страницы
+    нет", а именно отказ в доступе), стоит отличать от прочих сетевых ошибок."""
+
+
 def _category_url(category: str, page: int) -> str:
     url = MYINSTANTS_CATEGORY_URL.format(category=quote(category, safe="&"))
     if page > 1:
@@ -194,6 +213,29 @@ def parse_page(page_html: str) -> list[dict[str, str]]:
     return sounds
 
 
+_CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
+
+
+def _translate_to_english(query: str) -> str | None:
+    """Если запрос на кириллице — пробуем перевести на английский. Тайтлы
+    на MyInstants почти все английские, и нечёткое посимвольное сравнение
+    русской фразы с ними физически не может дать высокий балл (нет общих
+    букв) — так что без перевода поиск по-русски был обречён давать 0
+    независимо ни от какой блокировки. При любой ошибке перевода просто
+    возвращаем None — вызывающий код тогда работает только с оригиналом
+    (для нерусских запросов это и есть обычный путь)."""
+    if not _CYRILLIC_RE.search(query):
+        return None
+    try:
+        from deep_translator import GoogleTranslator
+
+        translated = GoogleTranslator(source="ru", target="en").translate(query)
+        return translated.strip() if translated else None
+    except Exception:
+        logger.warning("Не удалось перевести запрос «%s» на английский", query)
+        return None
+
+
 async def search_catalog(
     session: requests.Session,
     query: str,
@@ -202,16 +244,24 @@ async def search_catalog(
 ) -> list[dict[str, str]]:
     """Раз у сайта больше нет рабочего поиска по произвольному тексту —
     ищем сами: проходим по первым SEARCH_PAGES_PER_CATEGORY страницам
-    каждой категории, собираем названия и нечётко сравниваем с query через
-    mif_core.fuzzy_match_score. Возвращает до max_results совпадений,
-    отсортированных по убыванию релевантности (только те, что прошли
-    mif_core.FUZZY_MATCH_THRESHOLD).
+    каждой категории, собираем названия и нечётко сравниваем их с query
+    (и, если запрос на кириллице, с его английским переводом — берём
+    лучший балл из двух) через mif_core.fuzzy_match_score. Возвращает до
+    max_results совпадений, отсортированных по убыванию релевантности
+    (только те, что прошли mif_core.FUZZY_MATCH_THRESHOLD).
 
     Это ~14 HTTP-запросов подряд (по одному на категорию) — секунд 5-15.
     Приемлемо для команды типа /loadsSearch (не инлайн-запрос, Telegram не
     ограничивает время ответа на обычное сообщение), но не для чего-то,
     что должно быть мгновенным.
+
+    Кидает CatalogBlockedError, если сайт явно отвечает 403 (не "страницы
+    нет", а "в доступе отказано") — вызывающий код может отличить это от
+    прочих сетевых сбоев и сказать пользователю что-то более осмысленное.
     """
+    translated = await asyncio.to_thread(_translate_to_english, query)
+    query_variants = [query] + ([translated] if translated else [])
+
     candidates: list[tuple[float, dict[str, str]]] = []
 
     for category in MYINSTANTS_CATEGORIES:
@@ -221,16 +271,25 @@ async def search_catalog(
                 page_html = await asyncio.to_thread(fetch_page, session, url)
                 sounds = parse_page(page_html)
             except requests.HTTPError as error:
-                if error.response is not None and error.response.status_code in {404, 410}:
+                status = error.response.status_code if error.response is not None else None
+                if status in {404, 410}:
                     break
+                if status == 403:
+                    raise CatalogBlockedError(
+                        f"MyInstants ответил 403 на категории «{category}» — "
+                        "похоже на блокировку доступа"
+                    ) from error
                 raise
             if not sounds:
                 break
 
             for sound in sounds:
-                score = mif_core.fuzzy_match_score(query, sound["title"])
-                if score >= mif_core.FUZZY_MATCH_THRESHOLD:
-                    candidates.append((score, sound))
+                best_score = max(
+                    mif_core.fuzzy_match_score(variant, sound["title"])
+                    for variant in query_variants
+                )
+                if best_score >= mif_core.FUZZY_MATCH_THRESHOLD:
+                    candidates.append((best_score, sound))
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
     return [sound for _, sound in candidates[:max_results]]
@@ -254,7 +313,19 @@ def download_audio(session: requests.Session, url: str) -> bytes:
                 raise AudioTooLargeError
             chunks.append(chunk)
 
-    return b"".join(chunks)
+        content_type = response.headers.get("content-type", "")
+
+    audio_bytes = b"".join(chunks)
+
+    # raise_for_status() пропускает 200 OK — а капча/блок-страница Cloudflare
+    # обычно ПРИХОДИТ именно с кодом 200, просто с HTML вместо файла.
+    # Проверяем первые байты содержимого — надёжнее, чем гадать по невнятной
+    # ошибке ffmpeg или DOCUMENT_INVALID от Telegram тремя шагами позже.
+    head = audio_bytes[:512].lstrip().lower()
+    if head.startswith((b"<!doctype", b"<html", b"<?xml")) or b"<head" in head[:200]:
+        raise NotAudioContentError(content_type, audio_bytes[:200])
+
+    return audio_bytes
 
 
 async def import_sound(
@@ -321,6 +392,14 @@ async def import_sound(
         return True
     except AudioTooLargeError:
         logger.info("Пропущен, больше 20 МБ: %s", title)
+    except NotAudioContentError as error:
+        logger.error(
+            "«%s» скачался не как аудио (content-type=%r) — похоже на "
+            "капчу/блокировку доступа: %s",
+            title,
+            error.content_type,
+            sound["url"],
+        )
     except requests.RequestException:
         logger.exception("Не удалось скачать звук: %s", title)
     except TelegramAPIError:
@@ -383,7 +462,8 @@ async def main() -> None:
                     pager.advance_category()
                     continue
 
-                logger.info("Категория «%s», страница: найдено звуков=%s",
+                logger.info(
+                    "Категория «%s», страница: найдено звуков=%s",
                     pager.current_category,
                     len(sounds),
                 )
@@ -414,3 +494,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+    

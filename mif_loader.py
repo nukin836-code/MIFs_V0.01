@@ -74,6 +74,14 @@ async def import_one_sound(
         audio_bytes = await asyncio.to_thread(importer.download_audio, session, sound["url"])
     except importer.AudioTooLargeError:
         return "error", None
+    except importer.NotAudioContentError as error:
+        await mif_core.report_bug(
+            bot,
+            f"Автозагрузка: MyInstants вернул не аудио для «{title}» "
+            f"(content-type={error.content_type!r}) — похоже на капчу/блокировку "
+            f"доступа, а не битый файл: {sound['url']}",
+        )
+        return "error", None
     except requests.RequestException as error:
         await mif_core.report_bug(bot, f"Автозагрузка: не удалось скачать «{title}»: {error}")
         return "error", None
@@ -260,6 +268,13 @@ async def handle_loads_search(message: Message, query: str) -> None:
 
     try:
         candidates = await importer.search_catalog(session, query)
+    except importer.CatalogBlockedError:
+        logger.exception("MyInstants заблокировал доступ при поиске: %s", query)
+        await message.answer(
+            "⚠️MyInstants ответил 403 (отказ в доступе) — это подтверждает "
+            "блокировку, а не случайную сетевую ошибку. Попробуй позже."
+        )
+        return
     except requests.RequestException:
         logger.exception("Ошибка поиска на MyInstants: %s", query)
         await message.answer("⚠️Не удалось обратиться к MyInstants. Попробуй ещё раз позже.")
@@ -392,3 +407,4 @@ async def handle_loads_commands(message: Message) -> None:
         "/loadsStop — остановить\n"
         '/loadsSearch "запрос" — найти и загрузить конкретный звук'
     )
+    
