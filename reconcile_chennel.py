@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import html
 import json
 import logging
 import os
@@ -121,18 +120,14 @@ def next_id(database: list[dict[str, Any]]) -> int:
 def parse_caption(caption: str) -> dict[str, str] | None:
     """Достаёт метаданные из подписи. Понимает оба шаблона (бот / MyInstants).
     Возвращает None, если это не пост нашего формата вообще."""
-    # Подписи, созданные ботом, содержат HTML-разметку вида
-    # "<b>Описание от пользователя:</b> текст". Pyrogram может вернуть её
-    # вместе с caption, поэтому сначала приводим подпись к обычному тексту.
-    plain_caption = html.unescape(re.sub(r"<[^>]*>", "", caption))
-    user_desc_match = USER_DESC_RE.search(plain_caption)
-    bot_desc_match = BOT_DESC_RE.search(plain_caption)
+    user_desc_match = USER_DESC_RE.search(caption)
+    bot_desc_match = BOT_DESC_RE.search(caption)
 
     if not user_desc_match and not bot_desc_match:
         return None
 
-    file_id_match = FILE_ID_RE.search(plain_caption)
-    source_match = SOURCE_RE.search(plain_caption)
+    file_id_match = FILE_ID_RE.search(caption)
+    source_match = SOURCE_RE.search(caption)
 
     return {
         "file_id": file_id_match.group(1).strip() if file_id_match else "",
@@ -226,16 +221,10 @@ def build_entry(
 async def scan_and_merge(
     client: Client,
     database: list[dict[str, Any]],
-    bot: Bot,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Фаза 1 + Фаза 2. Возвращает (сколько добавлено напрямую, список
     "осиротевших" кандидатов, которым нужно фазу 3 — минтинг file_id ботом)."""
     known_file_ids = {str(mif.get("file_id")) for mif in database if mif.get("file_id")}
-    known_channel_message_ids = {
-        int(mif["channel_message_id"])
-        for mif in database
-        if str(mif.get("channel_message_id", "")).isdigit()
-    }
     known_hashes = {str(mif.get("content_hash")) for mif in database if mif.get("content_hash")}
 
     added_direct = 0
@@ -249,9 +238,6 @@ async def scan_and_merge(
 
         parsed = parse_caption(message.caption)
         if parsed is None:
-            continue
-
-        if message.id in known_channel_message_ids:
             continue
 
         explicit_file_id = parsed["file_id"]
@@ -269,17 +255,6 @@ async def scan_and_merge(
         file_type = "voice" if message.voice else "audio"
 
         if explicit_file_id:
-            try:
-                await bot.get_file(explicit_file_id)
-            except TelegramAPIError:
-                logger.warning(
-                    "file_id в подписи сообщения %s не принадлежит боту или устарел; "
-                    "восстановлю через copy_message",
-                    message.id,
-                )
-                explicit_file_id = ""
-
-        if explicit_file_id:
             entry = build_entry(
                 database=database,
                 file_id=explicit_file_id,
@@ -293,8 +268,6 @@ async def scan_and_merge(
             known_file_ids.add(explicit_file_id)
             if content_hash:
                 known_hashes.add(content_hash)
-            known_channel_message_ids.add(message.id)
-            save_database(database)
             added_direct += 1
         else:
             orphans.append(
@@ -306,7 +279,6 @@ async def scan_and_merge(
                     "content_hash": content_hash,
                 }
             )
-            known_channel_message_ids.add(message.id)
 
     return added_direct, orphans
 
@@ -314,7 +286,6 @@ async def scan_and_merge(
 async def mint_file_ids_for_orphans(
     orphans: list[dict[str, Any]],
     database: list[dict[str, Any]],
-    bot: Bot,
 ) -> int:
     """Фаза 3. Для постов без file_id в подписи бот копирует сообщение из
     канала себе в личный чат с админом — это выдаёт боту собственный,
@@ -322,13 +293,14 @@ async def mint_file_ids_for_orphans(
     if not orphans:
         return 0
 
+    bot_token = os.getenv("BOT_TOKEN")
     admin_chat_id = os.getenv("ADMIN_CHAT_ID")
 
-    if not admin_chat_id:
+    if not bot_token or not admin_chat_id:
         logger.warning(
             "Нашлось %d постов без file_id (например, из import_myinstants.py), "
-            "но ADMIN_CHAT_ID не задан — пропускаю восстановление этих записей. "
-            "Добавь секрет ADMIN_CHAT_ID и запусти скрипт ещё раз.",
+            "но BOT_TOKEN/ADMIN_CHAT_ID не заданы — пропускаю восстановление этих "
+            "записей. Заполни переменные окружения и запусти скрипт ещё раз.",
             len(orphans),
         )
         return 0
@@ -336,52 +308,52 @@ async def mint_file_ids_for_orphans(
     added = 0
     known_hashes = {str(mif.get("content_hash")) for mif in database if mif.get("content_hash")}
 
-    for orphan in orphans:
-        try:
-            sent_message = await bot.copy_message(
-                chat_id=int(admin_chat_id),
-                from_chat_id=CHANNEL_ID,
-                message_id=orphan["channel_message_id"],
+    async with Bot(token=bot_token) as bot:
+        for orphan in orphans:
+            try:
+                sent_message = await bot.copy_message(
+                    chat_id=int(admin_chat_id),
+                    from_chat_id=CHANNEL_ID,
+                    message_id=orphan["channel_message_id"],
+                )
+            except TelegramAPIError:
+                logger.exception(
+                    "Не удалось скопировать сообщение %s для минтинга file_id "
+                    "(проверь, что боту написали /start и ADMIN_CHAT_ID верный)",
+                    orphan["channel_message_id"],
+                )
+                continue
+
+            minted_file_id = None
+            if sent_message.voice:
+                minted_file_id = sent_message.voice.file_id
+            elif sent_message.audio:
+                minted_file_id = sent_message.audio.file_id
+
+            if not minted_file_id:
+                logger.warning(
+                    "Скопированное сообщение %s не содержит аудио — пропускаю",
+                    orphan["channel_message_id"],
+                )
+                continue
+
+            content_hash = orphan["content_hash"]
+            if content_hash and content_hash in known_hashes:
+                continue
+
+            entry = build_entry(
+                database=database,
+                file_id=minted_file_id,
+                file_type=orphan["file_type"],
+                user_description=orphan["user_description"],
+                bot_description=orphan["bot_description"],
+                channel_message_id=orphan["channel_message_id"],
+                content_hash=content_hash,
             )
-        except TelegramAPIError:
-            logger.exception(
-                "Не удалось скопировать сообщение %s для минтинга file_id "
-                "(проверь, что боту написали /start и ADMIN_CHAT_ID верный)",
-                orphan["channel_message_id"],
-            )
-            continue
-
-        minted_file_id = None
-        if sent_message.voice:
-            minted_file_id = sent_message.voice.file_id
-        elif sent_message.audio:
-            minted_file_id = sent_message.audio.file_id
-
-        if not minted_file_id:
-            logger.warning(
-                "Скопированное сообщение %s не содержит аудио — пропускаю",
-                orphan["channel_message_id"],
-            )
-            continue
-
-        content_hash = orphan["content_hash"]
-        if content_hash and content_hash in known_hashes:
-            continue
-
-        entry = build_entry(
-            database=database,
-            file_id=minted_file_id,
-            file_type=orphan["file_type"],
-            user_description=orphan["user_description"],
-            bot_description=orphan["bot_description"],
-            channel_message_id=orphan["channel_message_id"],
-            content_hash=content_hash,
-        )
-        database.append(entry)
-        if content_hash:
-            known_hashes.add(content_hash)
-        save_database(database)
-        added += 1
+            database.append(entry)
+            if content_hash:
+                known_hashes.add(content_hash)
+            added += 1
 
     return added
 
@@ -409,38 +381,18 @@ async def main() -> None:
 
     database = load_database()
 
-    bot_token = os.getenv("BOT_TOKEN")
-    if not bot_token:
-        raise RuntimeError("BOT_TOKEN is not configured")
+    async with client:
+        logger.info("Сканирую историю канала %s...", CHANNEL_ID)
+        added_direct, orphans = await scan_and_merge(client, database)
 
-    async with Bot(token=bot_token) as bot:
-        try:
-            channel = await bot.get_chat(CHANNEL_ID)
-        except TelegramAPIError as error:
-            raise RuntimeError(
-                f"Бот не видит канал {CHANNEL_ID}. Проверь CHANNEL_ID, "
-                "публичность канала и права бота-администратора."
-            ) from error
+    logger.info(
+        "Из истории канала напрямую добавлено %d записей, найдено %d "
+        "'осиротевших' постов без file_id в подписи.",
+        added_direct,
+        len(orphans),
+    )
 
-        logger.info(
-            "Канал доступен: %s (id=%s, type=%s)",
-            channel.title or channel.username or CHANNEL_ID,
-            channel.id,
-            channel.type,
-        )
-
-        async with client:
-            logger.info("Сканирую историю канала %s...", CHANNEL_ID)
-            added_direct, orphans = await scan_and_merge(client, database, bot)
-
-        logger.info(
-            "Из истории канала напрямую добавлено %d записей, найдено %d "
-            "'осиротевших' постов без рабочего file_id.",
-            added_direct,
-            len(orphans),
-        )
-
-        added_minted = await mint_file_ids_for_orphans(orphans, database, bot)
+    added_minted = await mint_file_ids_for_orphans(orphans, database)
 
     total_added = added_direct + added_minted
     if total_added:
