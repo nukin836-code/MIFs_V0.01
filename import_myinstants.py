@@ -52,7 +52,8 @@ MYINSTANTS_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
-    )
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
 # ВАЖНО, прочитай перед тем как трогать эти URL:
@@ -510,7 +511,7 @@ async def main() -> None:
         async with Bot(token=BOT_TOKEN) as bot:
             # Обходим все категории по кругу. Останавливаемся сами, если
             # прошли полный круг категорий и нигде не нашли ничего нового —
-            # иначе это будет буквально бесконечный процесс, что для
+                        # иначе это будет буквально бесконечный процесс, что для
             # ручного batch-запуска (в отличие от /loads в самом боте)
             # неожиданно.
             while categories_without_new_content_in_a_row < len(MYINSTANTS_CATEGORIES):
@@ -522,6 +523,10 @@ async def main() -> None:
                     if error.response is not None and error.response.status_code in {404, 410}:
                         pager.advance_category()
                         continue
+                    logger.exception("Не удалось загрузить страницу: %s", page_url)
+                    pager.advance_category()
+                    continue
+                except requests.RequestException:
                     logger.exception("Не удалось загрузить страницу: %s", page_url)
                     pager.advance_category()
                     continue
