@@ -267,7 +267,10 @@ async def handle_loads_search(message: Message, query: str) -> None:
     session.headers.update(importer.MYINSTANTS_HEADERS)
 
     try:
-        candidates = await importer.search_catalog(session, query)
+        # FUZZY_MATCH_FLOOR, а не строгий FUZZY_MATCH_THRESHOLD: человек сам
+        # попросил найти именно это, так что лучше честно показать ближайшую
+        # находку, чем молчать при отсутствии идеального совпадения.
+        candidates = await importer.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR)
     except importer.CatalogBlockedError:
         logger.exception("MyInstants заблокировал доступ при поиске: %s", query)
         await message.answer(
@@ -281,10 +284,14 @@ async def handle_loads_search(message: Message, query: str) -> None:
         return
 
     if not candidates:
-        await message.answer(f"На MyInstants ничего похожего на «{query}» не нашлось.")
+        await message.answer(
+            f"На MyInstants совсем ничего похожего на «{query}» не нашлось "
+            "(даже приблизительно) — просканированные категории пустые для этого запроса."
+        )
         return
 
-    sound = candidates[0]
+    best_score, sound = candidates[0]
+    is_confident_match = best_score >= mif_core.FUZZY_MATCH_THRESHOLD
 
     existing_by_title = mif_core.find_duplicate_by_title(sound["title"])
     if existing_by_title is not None:
@@ -309,7 +316,14 @@ async def handle_loads_search(message: Message, query: str) -> None:
         return
 
     if status == "added" and entry is not None:
-        await message.answer(f"✅Загрузил «{entry['title']}» и добавил в поиск.")
+        if is_confident_match:
+            await message.answer(f"✅Загрузил «{entry['title']}» и добавил в поиск.")
+        else:
+            await message.answer(
+                f"Точного совпадения для «{query}» не нашёл, но вот ближайшее, что "
+                f"удалось найти: «{entry['title']}» (балл совпадения {best_score:.0f}/100). "
+                "Загрузил и добавил в поиск — если это не то, попробуй другой запрос."
+            )
         return
 
     await message.answer(f"⚠️Не удалось загрузить «{sound['title']}». Попробуй другой запрос.")
@@ -334,11 +348,17 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
         session = requests.Session()
         session.headers.update(importer.MYINSTANTS_HEADERS)
 
-        candidates = await importer.search_catalog(session, query_text, max_results=1)
+        # Явно строгий порог (не FUZZY_MATCH_FLOOR, как у /loadsSearch) — это
+        # публикуется в общий канал автоматически, без человека, который мог
+        # бы сам решить "ну и ладно, похоже". Слабое совпадение здесь просто
+        # тихо ничего не находит, а не тащит в архив что попало.
+        candidates = await importer.search_catalog(
+            session, query_text, max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD
+        )
         if not candidates:
             return
 
-        sound = candidates[0]
+        _, sound = candidates[0]
 
         existing = mif_core.find_duplicate_by_title(sound["title"])
         if existing is not None:

@@ -241,14 +241,22 @@ async def search_catalog(
     query: str,
     *,
     max_results: int = 10,
-) -> list[dict[str, str]]:
+    min_score: float = mif_core.FUZZY_MATCH_THRESHOLD,
+) -> list[tuple[float, dict[str, str]]]:
     """Раз у сайта больше нет рабочего поиска по произвольному тексту —
     ищем сами: проходим по первым SEARCH_PAGES_PER_CATEGORY страницам
     каждой категории, собираем названия и нечётко сравниваем их с query
     (и, если запрос на кириллице, с его английским переводом — берём
-    лучший балл из двух) через mif_core.fuzzy_match_score. Возвращает до
-    max_results совпадений, отсортированных по убыванию релевантности
-    (только те, что прошли mif_core.FUZZY_MATCH_THRESHOLD).
+    лучший балл из двух) через mif_core.fuzzy_match_score.
+
+    Возвращает до max_results пар (балл, звук) с баллом >= min_score,
+    отсортированных по убыванию релевантности. min_score решает вызывающий
+    код, а не эта функция — у /loadsSearch (человек явно попросил, можно
+    честно показать "точного нет, но вот ближайшее") и у
+    background_internet_lookup (публикует в общий канал сам, без человека)
+    разные требования к строгости. По умолчанию — строгий
+    mif_core.FUZZY_MATCH_THRESHOLD; для best-effort передай
+    mif_core.FUZZY_MATCH_FLOOR или 0.
 
     Это ~14 HTTP-запросов подряд (по одному на категорию) — секунд 5-15.
     Приемлемо для команды типа /loadsSearch (не инлайн-запрос, Telegram не
@@ -288,11 +296,11 @@ async def search_catalog(
                     mif_core.fuzzy_match_score(variant, sound["title"])
                     for variant in query_variants
                 )
-                if best_score >= mif_core.FUZZY_MATCH_THRESHOLD:
+                if best_score >= min_score:
                     candidates.append((best_score, sound))
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
-    return [sound for _, sound in candidates[:max_results]]
+    return candidates[:max_results]
 
 
 def download_audio(session: requests.Session, url: str) -> bytes:
