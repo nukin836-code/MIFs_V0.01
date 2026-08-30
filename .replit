@@ -84,3 +84,8 @@ timeoutMs = 20000
 [nix]
 channel = "stable-25_05"
 packages = ["ffmpeg"]
+
+[userenv]
+
+[userenv.shared]
+CHANNEL_ID = "-1004309168724"
