@@ -71,33 +71,5 @@
     "user_tags": "мифки версии 1",
     "bot_tags": "микки версия",
     "tags": "мифки версии 1"
-  },
-  {
-    "id": "10",
-    "title": "тишына",
-    "file_id": "AwACAgIAAxkBAANVapJEcT5bvXqJbtY6cNPV-r7p_34AAgaYAAJ4aJhILgluxRcK25Y9BA",
-    "file_type": "voice",
-    "media_type": "voice",
-    "user_description": "тишына",
-    "bot_description": "",
-    "user_tags": "тишына",
-    "bot_tags": "",
-    "tags": "тишына",
-    "channel_message_id": 95,
-    "content_hash": "ec16d856c361316c656dadf7e4ae1716e7078d7d348dfe50f7de488cf5834345"
-  },
-  {
-    "id": "11",
-    "title": "Здравствуйте ничтожные нищие смертные",
-    "file_id": "AwACAgIAAyEGAAMBAAHYslQAA2BqkkTcCwn3Vq5f5NXYl96EG7W93AACb5sAAh7nmEh7vjfUoHpqOj0E",
-    "file_type": "voice",
-    "media_type": "voice",
-    "user_description": "Здравствуйте ничтожные нищие смертные",
-    "bot_description": "Здравствуйте ничтожные нищие смертные мои верные последователи сегодня ваш Великий Бог Элма играет враг долг и будет отвечать на ваши нищенские комментарии",
-    "user_tags": "здравствуйте ничтожные нищие смертные",
-    "bot_tags": "здравствуйте ничтожные нищие смертные мои верные последователи сегодня ваш великий бог элма играет враг долг и будет отвечать на ваши нищенские комментарии",
-    "tags": "здравствуйте ничтожные нищие смертные",
-    "channel_message_id": 96,
-    "content_hash": "6a483f5034f51c52d0600b77d6255673b468c442b3e14967f53b509a28a79afd"
   }
 ]
