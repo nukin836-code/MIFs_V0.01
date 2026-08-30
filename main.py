@@ -360,8 +360,6 @@ async def prepare_audio(
         )
 
 
-
-
 async def prepare_audio_from_bytes(
     audio_bytes: bytes,
     suffix: str = ".mp3",
@@ -455,7 +453,9 @@ async def publish_voice_mif(
     MIFS_DATABASE.append(new_mif)
     save_mifs()
     return new_mif
-    async def report_bug(bot: Bot, text: str) -> None:
+
+
+async def report_bug(bot: Bot, text: str) -> None:
     """Шлёт короткое сообщение об ошибке в группу для баг-репортов."""
     try:
         await bot.send_message(chat_id=int(BUG_REPORT_CHAT_ID), text=clip_text(text, 3500))
@@ -991,7 +991,7 @@ async def search_mifs(query: InlineQuery) -> None:
     user_input = query.query.lower().strip()
     # Мульти-поиск: бьём запрос на отдельные слова и требуем, чтобы КАЖДОЕ
     # слово нашлось где-то в тегах (не важно, в каком порядке и в каком
-    # конкретно поле — пользователком или авто-описании от бота).
+    # конкретно поле — пользовательском или авто-описании от бота).
     tokens = [token for token in user_input.split() if token]
     results = []
 
