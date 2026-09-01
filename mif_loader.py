@@ -73,6 +73,8 @@ loader_state = LoaderState()
 # mif_core.publish_voice_mif (лок), а не через это.
 DEBOUNCE_DELAY_SECONDS = 0.3
 _pending_debounce_tasks: dict[int, asyncio.Task] = {}
+# Словарь для анти-спама: запоминаем ID плашки, чтобы её редактировать
+_user_status_msg_id: dict[int, int] = {}
 
 
 def schedule_background_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
@@ -402,17 +404,26 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     Если это не так, просто тихо логируем и ничего не ломаем — человек и
     так уже получил обычный (пустой/слабый) инлайн-ответ.
     """
+        status_text = f"🔍Ищу в интернете: «{query_text}»..."
+    msg_id = _user_status_msg_id.get(requester_id)
+
     try:
-        await bot.send_message(requester_id, "🔍Ищу в интернете...")
+        if msg_id:
+            try:
+                await bot.edit_message_text(chat_id=requester_id, message_id=msg_id, text=status_text)
+            except TelegramAPIError:
+                new_msg = await bot.send_message(requester_id, status_text)
+                _user_status_msg_id[requester_id] = new_msg.message_id
+        else:
+            new_msg = await bot.send_message(requester_id, status_text)
+            _user_status_msg_id[requester_id] = new_msg.message_id
     except TelegramAPIError:
-        # requester_id никогда не писал боту — Telegram не даёт ботам
-        # первыми начинать личный чат. Дальше пытаться нет смысла: ни одно
-        # следующее сообщение всё равно не дойдёт.
         logger.info(
             "Не удалось начать фоновый поиск для %s (возможно, не начинал чат с ботом)",
             requester_id,
         )
         return
+        
 
     session = requests.Session()
     session.headers.update(importer.MYINSTANTS_HEADERS)
@@ -432,22 +443,23 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
         )
     except Exception:
         logger.exception("Быстрый фоновый поиск на MyInstants упал для запроса «%s»", query_text)
-        await _try_send_message(bot, requester_id, f"⚠️Не нашёл: «{query_text}»")
+        await _try_edit_message(bot, requester_id, f"⚠️Не нашёл: «{query_text}»")
         return
 
     if not candidates:
-        await _try_send_message(bot, requester_id, f"⚠️Не нашёл: «{query_text}»")
+        await _try_edit_message(bot, requester_id, f"⚠️Не нашёл: «{query_text}»")
         return
 
     _, sound = candidates[0]
 
     existing = mif_core.find_duplicate_by_title(sound["title"])
-    if existing is not None:
-        await _try_send_message(bot, requester_id, f"✅Нашёл: «{query_text}» — уже есть в базе:")
+        if existing is not None:
+        await _try_edit_message(bot, requester_id, f"✅ Нашёл: «{sound['title']}» (уже в базе)")
         await _try_send_voice(bot, requester_id, existing["file_id"])
         return
 
-    await _try_send_message(bot, requester_id, f"✅Нашёл: «{query_text}» — публикую в базу...")
+    await _try_edit_message(bot, requester_id, f"✅ Нашёл: «{sound['title']}» — публикую...")
+requester_id, f"✅Нашёл: «{query_text}» — публикую в базу...")
 
     # Дальше — медленная часть: скачивание, конвертация, публикация.
     try:
@@ -462,11 +474,16 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     await _try_send_voice(bot, requester_id, entry["file_id"])
 
 
-async def _try_send_message(bot: Bot, chat_id: int, text: str) -> None:
+async def _try_edit_message(bot: Bot, chat_id: int, text: str) -> None:
+    """Редактирует существующую плашку статуса. Если удалена - ничего страшного."""
+    msg_id = _user_status_msg_id.get(chat_id)
+    if not msg_id:
+        return
     try:
-        await bot.send_message(chat_id, text)
+        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
     except TelegramAPIError:
-        logger.info("Не удалось отправить сообщение пользователю %s", chat_id)
+        pass  # Сообщение не изменилось или удалено
+        
 
 
 async def _try_send_voice(bot: Bot, chat_id: int, file_id: str) -> None:
