@@ -33,6 +33,7 @@ from rapidfuzz import fuzz
 logger = logging.getLogger("mif-bot.core")
 
 DATABASE_PATH = Path(__file__).with_name("mifs_database.json")
+MUTED_USERS_PATH = Path(__file__).with_name("muted_users.json")
 LEGACY_DATABASE_PATH = Path(__file__).with_name("mifs.json")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@MIFFFKI")
 MAX_CAPTION_TEXT_LENGTH = 300
@@ -121,7 +122,6 @@ DEFAULT_MIFS: list[dict[str, str]] = [
     },
 ]
 
-
 def load_mifs() -> list[dict[str, Any]]:
     source_path = DATABASE_PATH
     if not source_path.exists() and LEGACY_DATABASE_PATH.exists():
@@ -179,6 +179,54 @@ def find_duplicate_by_title(title: str) -> dict[str, Any] | None:
         if str(mif.get("title", "")).strip().lower() == title_key:
             return mif
     return None
+
+
+# --- /mute, /unmute ----------------------------------------------------
+
+
+def _load_muted_users() -> set[int]:
+    if not MUTED_USERS_PATH.exists():
+        return set()
+    try:
+        data = json.loads(MUTED_USERS_PATH.read_text(encoding="utf-8"))
+    except (OSError, JSONDecodeError):
+        logger.exception("Не удалось прочитать список заглушённых пользователей")
+        return set()
+    if not isinstance(data, list):
+        return set()
+    result: set[int] = set()
+    for item in data:
+        try:
+            result.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _save_muted_users() -> None:
+    temporary_path = MUTED_USERS_PATH.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps(sorted(MUTED_USERS), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary_path.replace(MUTED_USERS_PATH)
+
+
+MUTED_USERS: set[int] = _load_muted_users()
+
+
+def is_muted(user_id: int) -> bool:
+    return user_id in MUTED_USERS
+
+
+def mute_user(user_id: int) -> None:
+    MUTED_USERS.add(user_id)
+    _save_muted_users()
+
+
+def unmute_user(user_id: int) -> None:
+    MUTED_USERS.discard(user_id)
+    _save_muted_users()
 
 
 # --- Поиск (точное вхождение + нечёткий рейтинг через rapidfuzz) -----------
@@ -543,7 +591,6 @@ async def prepare_audio_from_bytes(
 
 
 # --- Публикация с защитой от flood control ----------------------------------
-
 _T = TypeVar("_T")
 
 
@@ -605,6 +652,7 @@ async def publish_voice_mif(
     Возвращает (status, mif):
     - ("duplicate", уже_существующая_запись) — ничего не публиковалось;
     - ("added", новая_запись) — опубликовано и сохранено.
+
     Один из ogg_bytes / existing_voice_file_id должен быть передан (нужны
     только при статусе "added"): existing_voice_file_id — когда источник
     уже voice-сообщение Telegram (конвертация не нужна, просто

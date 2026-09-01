@@ -482,7 +482,7 @@ def download_audio(session: requests.Session, url: str) -> bytes:
 
     audio_bytes = b"".join(chunks)
 
-    # raise_for_status() пропускает 200 OK — а капча/блок-страница Cloudflare
+        # raise_for_status() пропускает 200 OK — а капча/блок-страница Cloudflare
     # обычно ПРИХОДИТ именно с кодом 200, просто с HTML вместо файла.
     # Проверяем первые байты содержимого — надёжнее, чем гадать по невнятной
     # ошибке ffmpeg или DOCUMENT_INVALID от Telegram тремя шагами позже.

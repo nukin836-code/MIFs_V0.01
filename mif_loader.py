@@ -73,8 +73,6 @@ loader_state = LoaderState()
 # mif_core.publish_voice_mif (лок), а не через это.
 DEBOUNCE_DELAY_SECONDS = 0.3
 _pending_debounce_tasks: dict[int, asyncio.Task] = {}
-# Словарь для анти-спама: запоминаем ID плашки, чтобы её редактировать
-_user_status_msg_id: dict[int, int] = {}
 
 
 def schedule_background_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
@@ -378,52 +376,50 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     """Локальный инлайн-поиск дал слабое совпадение (см. main.py:search_mifs)
     — пробуем найти похожий звук на MyInstants в фоне и, если получится,
     публикуем его (через тот же import_one_sound/publish_voice_mif, что и
-    везде) и присылаем автору запроса личным сообщением.
+    везде). Поиск и публикация всегда выполняются полностью — даже для
+    заглушённого (mute) пользователя: заглушка отключает только сообщения
+    ЕМУ, общая база по-прежнему пополняется для всех.
 
-    Разделено на быструю и медленную части намеренно:
-    1. Быстрая: "🔍Ищу в интернете..." → только API-поиск (search_catalog
-       с fast_only=True, оба варианта запроса параллельно) →
-       "✅Нашёл"/"⚠️Не нашёл". Реалистично 1-3 секунды в обычном случае.
-    2. Медленная (только если нашёл): скачать → сконвертировать →
-       опубликовать → прислать сам файл. Это реально занимает несколько
-       секунд ещё — скачивание, ffmpeg, распознавание речи, загрузка в
-       Telegram — тут нечего ускорять без потери в качестве. Разделение
-       специально: подтверждение "нашёл/не нашёл" быстрое, а не всё целиком.
+    Статусы, которые видит человек (если не заглушил):
+    🔍 Ищу в интернете «запрос»...      — стартовало (локальный поиск ничего не дал)
+    ➖ Нашёл: «запрос» — публикую...    — нашли на сайте, качаем/конвертируем/публикуем
+    ✅ Готово                           — опубликовано (или уже было в базе)
+    ⚠️ Не нашёл: «запрос»               — не нашлось ни в базе, ни в интернете
+
+    Специально БЕЗ отправки самого голосового файла в личку — только
+    статус. Найти сам звук после "✅Готово" можно обычным инлайн-поиском.
 
     ВАЖНО: результат не может попасть в тот же самый инлайн-ответ — как
     только Telegram показал инлайн-подсказки, дополнить их позже нельзя,
-    результат обязательно приходит отдельными сообщениями в личку.
+    статус обязательно приходит отдельными сообщениями в личку.
 
     ВЫЗЫВАТЬ НЕ НАПРЯМУЮ, а через schedule_background_lookup — эта функция
     сама не знает про debounce, ждёт вызова "прямо сейчас, точно финальный
     запрос". Защита от спама на каждую букву во время печати живёт в
     schedule_background_lookup, не здесь.
 
-    ТАКЖЕ ВАЖНО: сработает, только если requester_id уже хотя бы раз писал
-    боту (/start) — Telegram не разрешает ботам первыми писать пользователю.
-    Если это не так, просто тихо логируем и ничего не ломаем — человек и
-    так уже получил обычный (пустой/слабый) инлайн-ответ.
+    ТАКЖЕ ВАЖНО: сообщения дойдут, только если requester_id уже хотя бы раз
+    писал боту (/start) — Telegram не разрешает ботам первыми писать
+    пользователю. Если это не так, просто тихо логируем и не пишем дальше
+    (поиск и публикация всё равно продолжаются — базе это не мешает).
     """
-    status_text = f"🔍Ищу в интернете: «{query_text}»..."
-    msg_id = _user_status_msg_id.get(requester_id)
+    muted = mif_core.is_muted(requester_id)
+    can_message = True
 
-    try:
-        if msg_id:
-            try:
-                await bot.edit_message_text(chat_id=requester_id, message_id=msg_id, text=status_text)
-            except TelegramAPIError:
-                new_msg = await bot.send_message(requester_id, status_text)
-                _user_status_msg_id[requester_id] = new_msg.message_id
-        else:
-            new_msg = await bot.send_message(requester_id, status_text)
-            _user_status_msg_id[requester_id] = new_msg.message_id
-    except TelegramAPIError:
-        logger.info(
-            "Не удалось начать фоновый поиск для %s (возможно, не начинал чат с ботом)",
-            requester_id,
-        )
-        return
-        
+    if not muted:
+        try:
+            await bot.send_message(requester_id, f"🔍Ищу в интернете «{query_text}»...")
+        except TelegramAPIError:
+            logger.info(
+                "Не удалось написать пользователю %s (возможно, не начинал чат с ботом) — "
+                "поиск всё равно продолжится, просто без статусов ему",
+                requester_id,
+            )
+            can_message = False
+
+    async def notify(text: str) -> None:
+        if not muted and can_message:
+            await _try_send_message(bot, requester_id, text)
 
     session = requests.Session()
     session.headers.update(importer.MYINSTANTS_HEADERS)
@@ -443,22 +439,22 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
         )
     except Exception:
         logger.exception("Быстрый фоновый поиск на MyInstants упал для запроса «%s»", query_text)
-        await _try_edit_message(bot, requester_id, f"⚠️Не нашёл: «{query_text}»")
+        await notify(f"⚠️Не нашёл: «{query_text}»")
         return
 
     if not candidates:
-        await _try_edit_message(bot, requester_id, f"⚠️Не нашёл: «{query_text}»")
+        await notify(f"⚠️Не нашёл: «{query_text}»")
         return
 
     _, sound = candidates[0]
 
     existing = mif_core.find_duplicate_by_title(sound["title"])
     if existing is not None:
-        await _try_edit_message(bot, requester_id, f"✅ Нашёл: «{sound['title']}» (уже в базе)")
-        await _try_send_voice(bot, requester_id, existing["file_id"])
+        # Уже есть — качать/конвертировать нечего, сразу готово.
+        await notify("✅Готово")
         return
 
-    await _try_edit_message(bot, requester_id, f"✅ Нашёл: «{sound['title']}» — публикую...")
+    await notify(f"➖Нашёл: «{query_text}» — публикую в базу...")
 
     # Дальше — медленная часть: скачивание, конвертация, публикация.
     try:
@@ -467,29 +463,15 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
         logger.exception("Публикация после фонового поиска упала для запроса «%s»", query_text)
         return
 
-    if status != "added" or entry is None:
-        return
-
-    await _try_send_voice(bot, requester_id, entry["file_id"])
+    if status in ("added", "duplicate") and entry is not None:
+        await notify("✅Готово")
 
 
-async def _try_edit_message(bot: Bot, chat_id: int, text: str) -> None:
-    """Редактирует существующую плашку статуса. Если удалена - ничего страшного."""
-    msg_id = _user_status_msg_id.get(chat_id)
-    if not msg_id:
-        return
+async def _try_send_message(bot: Bot, chat_id: int, text: str) -> None:
     try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+        await bot.send_message(chat_id, text)
     except TelegramAPIError:
-        pass  # Сообщение не изменилось или удалено
-        
-
-
-async def _try_send_voice(bot: Bot, chat_id: int, file_id: str) -> None:
-    try:
-        await bot.send_voice(chat_id, voice=file_id)
-    except TelegramAPIError:
-        logger.info("Не удалось отправить голосовое пользователю %s", chat_id)
+        logger.info("Не удалось отправить сообщение пользователю %s", chat_id)
 
 
 async def handle_loads_commands(message: Message) -> None:
@@ -501,6 +483,7 @@ async def handle_loads_commands(message: Message) -> None:
     if search_match:
         await handle_loads_search(message, search_match.group(1).strip())
         return
+
     if message.from_user is None or message.from_user.id != LOADS_ADMIN_ID:
         await message.answer("⛔Эта команда доступна только администратору автозагрузки.")
         return
