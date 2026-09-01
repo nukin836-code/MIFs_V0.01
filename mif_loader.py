@@ -174,7 +174,8 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
     session = requests.Session()
     session.headers.update(importer.MYINSTANTS_HEADERS)
     pager = importer.CatalogPager()
-    y:
+
+    try:
         while not loader_state.stop_event.is_set():
             if target_count is not None and loader_state.added_count >= target_count:
                 break
@@ -484,8 +485,7 @@ async def handle_loads_commands(message: Message) -> None:
     if search_match:
         await handle_loads_search(message, search_match.group(1).strip())
         return
-
-    if message.from_user is None or message.from_user.id != LOADS_ADMIN_ID:
+        if message.from_user is None or message.from_user.id != LOADS_ADMIN_ID:
         await message.answer("⛔Эта команда доступна только администратору автозагрузки.")
         return
 
