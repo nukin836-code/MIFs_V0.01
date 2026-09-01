@@ -404,7 +404,7 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     Если это не так, просто тихо логируем и ничего не ломаем — человек и
     так уже получил обычный (пустой/слабый) инлайн-ответ.
     """
-        status_text = f"🔍Ищу в интернете: «{query_text}»..."
+    status_text = f"🔍Ищу в интернете: «{query_text}»..."
     msg_id = _user_status_msg_id.get(requester_id)
 
     try:
