@@ -485,7 +485,7 @@ async def handle_loads_commands(message: Message) -> None:
     if search_match:
         await handle_loads_search(message, search_match.group(1).strip())
         return
-        if message.from_user is None or message.from_user.id != LOADS_ADMIN_ID:
+    if message.from_user is None or message.from_user.id != LOADS_ADMIN_ID:
         await message.answer("⛔Эта команда доступна только администратору автозагрузки.")
         return
 
