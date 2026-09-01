@@ -18,6 +18,7 @@ import html
 import json
 import logging
 import os
+import re
 import tempfile
 from json import JSONDecodeError
 from pathlib import Path
@@ -214,6 +215,36 @@ FUZZY_MATCH_THRESHOLD = 65.0
 FUZZY_MATCH_FLOOR = 60.0
 
 
+_CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁіІїЇєЄґҐ]")  # + украинские буквы i/ї/є/ґ, которых нет в русском
+
+
+def translate_to_english(query: str) -> str | None:
+    """Если запрос на кириллице (русской или украинской — не важно, какой
+    именно, определяем сам факт кириллицы) — пробуем перевести на
+    английский. source="auto" сам определяет язык.
+
+    ОБЩАЯ утилита: раньше жила только в import_myinstants.py и переводила
+    запрос только для поиска на MyInstants — из-за этого локальный поиск
+    по своей же базе (find_matching_mifs, инлайн-режим) пропускал записи,
+    у которых теги на английском, если человек искал по-русски, даже если
+    звук уже был в базе. Теперь один и тот же перевод используется и тут, и
+    там. При любой ошибке перевода просто возвращаем None — вызывающий код
+    тогда работает только с оригиналом."""
+    if not _CYRILLIC_RE.search(query):
+        return None
+    try:
+        from deep_translator import GoogleTranslator
+
+        translated = GoogleTranslator(source="auto", target="en").translate(query)
+        if translated:
+            logger.info("Перевёл запрос «%s» → «%s»", query, translated)
+            return translated.strip()
+        return None
+    except Exception:
+        logger.warning("Не удалось перевести запрос «%s» на английский", query, exc_info=True)
+        return None
+
+
 def fuzzy_match_score(query: str, text: str) -> float:
     """Простое (без разбивки по источникам и весам) нечёткое сравнение —
     для сопоставления с ВНЕШНИМИ данными вроде заголовков MyInstants, а не
@@ -262,6 +293,13 @@ def find_matching_mifs(query_text: str) -> tuple[list[dict[str, Any]], float]:
     вызывающему коду (main.py), чтобы решить, стоит ли запускать фоновый
     поиск на MyInstants — см. mif_loader.background_internet_lookup.
 
+    Пробует и оригинальный запрос, и (если он на кириллице) его английский
+    перевод — берёт для каждой записи лучший из двух результатов. Это
+    закрывает случай "звук уже есть в базе под английским названием, но
+    искали по-русски" прямо тут, инлайн, без похода в фоновый поиск и
+    личку — единственное место, где это вообще можно сделать: инлайн-ответ
+    Telegram нельзя дополнить результатом, найденным позже.
+
     Пустой запрос: не фильтруем и не сортируем (нечего ранжировать),
     отдаём первые MAX_INLINE_RESULTS — именно это чинит падение при
     пустом/однобуквенном запросе, а не "фильтрация в один шаг".
@@ -273,12 +311,21 @@ def find_matching_mifs(query_text: str) -> tuple[list[dict[str, Any]], float]:
         # искать), поэтому best_score = 100.0, а не 0.0.
         return list(MIFS_DATABASE[:MAX_INLINE_RESULTS]), 100.0
 
+    translated = translate_to_english(query_text)
+    translated_tokens = (
+        [token for token in translated.lower().strip().split() if token] if translated else []
+    )
+
     scored: list[tuple[float, dict[str, Any]]] = []
     for mif in MIFS_DATABASE:
         user_tags = str(mif.get("user_tags", mif.get("tags", ""))).lower()
         bot_tags = str(mif.get("bot_tags", mif.get("bot_description", ""))).lower()
 
         score = _score_mif_tokens(tokens, user_tags, bot_tags)
+        if translated_tokens:
+            translated_score = _score_mif_tokens(translated_tokens, user_tags, bot_tags)
+            if translated_score is not None and (score is None or translated_score > score):
+                score = translated_score
         if score is None:
             continue
         scored.append((score, mif))
@@ -366,6 +413,39 @@ def compute_content_hash(wav_path: Path) -> str:
     return hasher.hexdigest()
 
 
+# recognize_google не умеет сам определять язык — приходится указывать
+# явно. Раньше был жёстко зашит только ru-RU, из-за чего распознавание
+# ломалось на любой английской речи (а её теперь много — контент с
+# MyInstants в основном на английском). Пробуем по очереди; переходим к
+# следующему языку, только если текущий вообще ничего не распознал
+# (UnknownValueError) — так успешный случай не становится медленнее, а
+# страдает только полностью нераспознанный.
+STT_LANGUAGES: tuple[str, ...] = ("ru-RU", "en-US")
+
+
+async def _recognize_speech(audio_data: "sr.AudioData") -> tuple[str, str | None]:
+    recognizer = sr.Recognizer()
+    recognizer.operation_timeout = TRANSCRIPTION_TIMEOUT_SECONDS
+
+    for language in STT_LANGUAGES:
+        try:
+            text = await asyncio.to_thread(
+                recognizer.recognize_google, audio_data, language=language
+            )
+            return text.strip(), None
+        except sr.UnknownValueError:
+            continue
+        except sr.RequestError:
+            logger.exception("Сервис Speech-to-Text недоступен")
+            return "", "Сервис распознавания речи временно недоступен."
+        except Exception:
+            logger.exception("Неожиданная ошибка при распознавании аудио (язык %s)", language)
+            return "", "Произошла ошибка при распознавании речи."
+
+    logger.info("Речь не распознана ни на одном из языков: %s", STT_LANGUAGES)
+    return "", "Речь в аудиофайле не распознана."
+
+
 async def analyze_and_convert(
     source_path: Path,
     temporary_directory: Path,
@@ -374,7 +454,8 @@ async def analyze_and_convert(
 ) -> tuple[str, str | None, bytes | None, str | None]:
     """Общее ядро обработки одного аудиофайла вне зависимости от того, откуда
     он взялся (загружен пользователем в Telegram или скачан с сайта):
-    1) распознаёт речь для авто-описания,
+    1) распознаёт речь для авто-описания (пробует несколько языков — см.
+       STT_LANGUAGES и _recognize_speech),
     2) считает хэш нормализованного звука — для обнаружения повторок,
     3) если convert_voice=True — перегоняет в Opus/OGG для публикации как
        голосового сообщения (не нужно, если источник уже voice).
@@ -396,28 +477,9 @@ async def analyze_and_convert(
         transcription_error = "Не удалось обработать аудио для распознавания речи."
     else:
         content_hash = compute_content_hash(wav_path)
-        try:
-            recognizer = sr.Recognizer()
-            recognizer.operation_timeout = TRANSCRIPTION_TIMEOUT_SECONDS
-
-            with sr.AudioFile(str(wav_path)) as audio_source:
-                audio_data = recognizer.record(audio_source)
-
-            recognized_text = await asyncio.to_thread(
-                recognizer.recognize_google,
-                audio_data,
-                language="ru-RU",
-            )
-            recognized_text = recognized_text.strip()
-        except sr.UnknownValueError:
-            logger.info("Речь в аудиофайле не распознана")
-            transcription_error = "Речь в аудиофайле не распознана."
-        except sr.RequestError:
-            logger.exception("Сервис Speech-to-Text недоступен")
-            transcription_error = "Сервис распознавания речи временно недоступен."
-        except Exception:
-            logger.exception("Неожиданная ошибка при распознавании аудио")
-            transcription_error = "Произошла ошибка при распознавании речи."
+        with sr.AudioFile(str(wav_path)) as audio_source:
+            audio_data = sr.Recognizer().record(audio_source)
+        recognized_text, transcription_error = await _recognize_speech(audio_data)
 
     ogg_bytes: bytes | None = None
     if convert_voice:
@@ -508,6 +570,17 @@ async def _call_with_flood_retry(action: Callable[[], Awaitable[_T]]) -> _T:
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
+# Несколько источников (фоновая /loads, автопоиск от разных пользователей
+# одновременно, /loadsSearch) могут одновременно наткнуться на один и тот
+# же звук. Раньше проверка "такого ещё нет" и сама публикация были
+# раздельными шагами — оба успевали пройти проверку раньше, чем любой из
+# них допишет запись в базу, и оба публиковали один и тот же звук под
+# разными file_id. Проверено на практике, реальный баг. Лок делает
+# "проверить дубликат → опубликовать → записать в базу" одной неделимой
+# операцией.
+_publish_lock = asyncio.Lock()
+
+
 async def publish_voice_mif(
     bot: Bot,
     *,
@@ -520,79 +593,94 @@ async def publish_voice_mif(
     content_hash: str | None,
     source_url: str | None = None,
     extra_fields: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Единая точка публикации: отправляет голосовое в канал, дозаписывает в
-    подпись реальный (боту принадлежащий) file_id и сохраняет запись в базе.
-    Используется и ручной загрузкой (main.py), и /loads/loadsSearch
+) -> tuple[str, dict[str, Any]]:
+    """Единая точка публикации: атомарно проверяет дубликат по content_hash
+    и публикует (если это не дубликат). Используется и ручной загрузкой
+    (main.py), и /loads/loadsSearch/background_internet_lookup
     (mif_loader.py), и batch-импортом (import_myinstants.py) — благодаря
-    этому все пути публикации ведут себя гарантированно одинаково.
+    этому все пути публикации ведут себя гарантированно одинаково И не
+    могут задвоить запись при параллельном срабатывании (см. _publish_lock
+    выше).
 
-    Один из ogg_bytes / existing_voice_file_id должен быть передан:
-    existing_voice_file_id — когда источник уже voice-сообщение Telegram
-    (конвертация не нужна, просто переиспользуем тот же файл); ogg_bytes —
-    когда файл только что перегнан в Opus/OGG.
+    Возвращает (status, mif):
+    - ("duplicate", уже_существующая_запись) — ничего не публиковалось;
+    - ("added", новая_запись) — опубликовано и сохранено.
+    Один из ogg_bytes / existing_voice_file_id должен быть передан (нужны
+    только при статусе "added"): existing_voice_file_id — когда источник
+    уже voice-сообщение Telegram (конвертация не нужна, просто
+    переиспользуем тот же файл); ogg_bytes — когда файл только что
+    перегнан в Opus/OGG.
 
     Кидает TelegramAPIError, если публикация в канал не удалась даже после
     повторов при flood control — вызывающий код сам решает, как об этом
-    сообщить.
+    сообщить. Лок при этом освобождается (async with), следующая проверка
+    дубликата не блокируется навсегда из-за одной неудачной публикации.
     """
-    voice_source: str | BufferedInputFile
-    if existing_voice_file_id is not None:
-        voice_source = existing_voice_file_id
-    else:
-        assert ogg_bytes is not None
-        voice_source = BufferedInputFile(ogg_bytes, filename="voice.ogg")
+    async with _publish_lock:
+        if content_hash:
+            existing = find_duplicate_by_hash(content_hash)
+            if existing is not None:
+                return "duplicate", existing
 
-    sent_message = await _call_with_flood_retry(
-        lambda: bot.send_voice(
-            chat_id=CHANNEL_ID,
-            voice=voice_source,
-            caption=base_caption,
-            parse_mode="HTML",
-        )
-    )
+        voice_source: str | BufferedInputFile
+        if existing_voice_file_id is not None:
+            voice_source = existing_voice_file_id
+        else:
+            assert ogg_bytes is not None
+            voice_source = BufferedInputFile(ogg_bytes, filename="voice.ogg")
 
-    resolved_file_id = sent_message.voice.file_id
-    final_caption = f"{base_caption}\n<b>file_id:</b> <code>{html.escape(resolved_file_id)}</code>"
-    try:
-        await _call_with_flood_retry(
-            lambda: bot.edit_message_caption(
+        sent_message = await _call_with_flood_retry(
+            lambda: bot.send_voice(
                 chat_id=CHANNEL_ID,
-                message_id=sent_message.message_id,
-                caption=final_caption,
+                voice=voice_source,
+                caption=base_caption,
                 parse_mode="HTML",
             )
         )
-    except TelegramAPIError:
-        # Кэш всё равно содержит правильный ID. Если подпись не удалось
-        # изменить, reconcile_channel.py восстановит её через copy_message.
-        logger.exception(
-            "Не удалось дописать фактический file_id в подпись поста %s",
-            sent_message.message_id,
+
+        resolved_file_id = sent_message.voice.file_id
+        final_caption = (
+            f"{base_caption}\n<b>file_id:</b> <code>{html.escape(resolved_file_id)}</code>"
         )
+        try:
+            await _call_with_flood_retry(
+                lambda: bot.edit_message_caption(
+                    chat_id=CHANNEL_ID,
+                    message_id=sent_message.message_id,
+                    caption=final_caption,
+                    parse_mode="HTML",
+                )
+            )
+        except TelegramAPIError:
+            # Кэш всё равно содержит правильный ID. Если подпись не удалось
+            # изменить, reconcile_channel.py восстановит её через copy_message.
+            logger.exception(
+                "Не удалось дописать фактический file_id в подпись поста %s",
+                sent_message.message_id,
+            )
 
-    new_mif: dict[str, Any] = {
-        "id": next_mif_id(),
-        "title": title,
-        "file_id": resolved_file_id,
-        "file_type": "voice",
-        "media_type": "voice",
-        "user_description": title,
-        "bot_description": bot_description,
-        "user_tags": tags_text.lower(),
-        "bot_tags": bot_description.lower(),
-        "tags": tags_text.lower(),
-        "channel_message_id": sent_message.message_id,
-        "content_hash": content_hash,
-    }
-    if source_url:
-        new_mif["source_url"] = source_url
-    if extra_fields:
-        new_mif.update(extra_fields)
+        new_mif: dict[str, Any] = {
+            "id": next_mif_id(),
+            "title": title,
+            "file_id": resolved_file_id,
+            "file_type": "voice",
+            "media_type": "voice",
+            "user_description": title,
+            "bot_description": bot_description,
+            "user_tags": tags_text.lower(),
+            "bot_tags": bot_description.lower(),
+            "tags": tags_text.lower(),
+            "channel_message_id": sent_message.message_id,
+            "content_hash": content_hash,
+        }
+        if source_url:
+            new_mif["source_url"] = source_url
+        if extra_fields:
+            new_mif.update(extra_fields)
 
-    MIFS_DATABASE.append(new_mif)
-    save_mifs()
-    return new_mif
+        MIFS_DATABASE.append(new_mif)
+        save_mifs()
+        return "added", new_mif
 
 
 async def report_bug(bot: Bot, text: str) -> None:

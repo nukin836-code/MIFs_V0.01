@@ -214,8 +214,6 @@ def parse_page(page_html: str) -> list[dict[str, str]]:
     return sounds
 
 
-_CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁіІїЇєЄґҐ]")  # + украинские буквы i/ї/є/ґ, которых нет в русском
-
 MYINSTANTS_SEARCH_URL = f"{MYINSTANTS_BASE_URL}/ru/search/?name={{query}}"
 
 # Проверено напрямую: это настоящий JSON API (эндпоинт мобильного
@@ -228,30 +226,9 @@ MYINSTANTS_SEARCH_URL = f"{MYINSTANTS_BASE_URL}/ru/search/?name={{query}}"
 # напрямую.
 MYINSTANTS_API_URL = f"{MYINSTANTS_BASE_URL}/api/v1/instants/"
 
-
-def _translate_to_english(query: str) -> str | None:
-    """Если запрос на кириллице (русской ИЛИ украинской — не важно, какой
-    именно, определяем сам факт кириллицы) — пробуем перевести на
-    английский. source="auto" сам определит язык, не нужно гадать
-    заранее — так это работает и для русского, и для украинского, и для
-    чего угодно ещё. Тайтлы на MyInstants почти все английские, и нечёткое
-    посимвольное сравнение кириллической фразы с ними физически не может
-    дать высокий балл без перевода (нет общих букв). При любой ошибке
-    перевода просто возвращаем None — вызывающий код тогда работает только
-    с оригиналом."""
-    if not _CYRILLIC_RE.search(query):
-        return None
-    try:
-        from deep_translator import GoogleTranslator
-
-        translated = GoogleTranslator(source="auto", target="en").translate(query)
-        if translated:
-            logger.info("Перевёл запрос «%s» → «%s»", query, translated)
-            return translated.strip()
-        return None
-    except Exception:
-        logger.warning("Не удалось перевести запрос «%s» на английский", query, exc_info=True)
-        return None
+# Перевод запроса теперь общая утилита в mif_core.translate_to_english —
+# используется и здесь, и в локальном поиске по базе (mif_core.find_matching_mifs),
+# чтобы поведение перевода не расходилось между двумя местами поиска.
 
 
 def _parse_api_payload(payload: Any, query: str) -> list[dict[str, str]]:
@@ -353,6 +330,7 @@ async def search_catalog(
     *,
     max_results: int = 10,
     min_score: float = mif_core.FUZZY_MATCH_THRESHOLD,
+    fast_only: bool = False,
 ) -> list[tuple[float, dict[str, str]]]:
     """Ищет звук по произвольному тексту в три каскадных этапа, каждый
     следующий запускается только если предыдущий не дал ни одного
@@ -360,7 +338,8 @@ async def search_catalog(
 
     1. JSON API (/api/v1/instants/?name=) — структурированные данные,
        официальный эндпоинт мобильного приложения сайта. Самый быстрый и
-       надёжный источник, пробуется первым.
+       надёжный источник, пробуется первым. Оба варианта запроса (оригинал
+       и перевод) уходят ПАРАЛЛЕЛЬНО (asyncio.gather), а не по очереди.
     2. HTML-поиск сайта (/ru/search/?name=) — подтверждённо живой путь
        (в отличие от /en/search/, отвечающего 404), но не проверено на
        100%, фильтрует ли он на стороне сайта.
@@ -368,21 +347,19 @@ async def search_catalog(
        медленнее (секунд 5-15), но точно рабочий путь, проверенный
        напрямую, финальный резерв.
 
-    На каждом этапе пробуются оба варианта запроса — оригинал и, если он
-    на кириллице, английский перевод. Что бы ни вернул любой из трёх
-    источников, оно всё равно проходит через один и тот же fuzzy-скоринг
-    (mif_core.fuzzy_match_score) — нерелевантное отсеивается порогом
-    независимо от того, насколько мы доверяем фильтрации на стороне сайта.
+    fast_only=True пропускает этапы 2 и 3 совсем — только быстрый API,
+    параллельно по обоим вариантам запроса. Для background_internet_lookup
+    (автоматический фон, нужен быстрый да/нет за пару секунд, а не
+    исчерпывающий поиск) — /loadsSearch (человек сам попросил и готов
+    подождать) использует fast_only=False, весь каскад.
+
+    Что бы ни вернул любой из источников, оно всё равно проходит через
+    один и тот же fuzzy-скоринг (mif_core.fuzzy_match_score) —
+    нерелевантное отсеивается порогом независимо от того, насколько мы
+    доверяем фильтрации на стороне сайта.
 
     Возвращает до max_results пар (балл, звук) с баллом >= min_score,
-    отсортированных по убыванию релевантности. min_score решает вызывающий
-    код для этапов 1-2 (настоящий поиск сайта — там есть хоть какая-то
-    осмысленность в том, что вернулось): у /loadsSearch (человек явно
-    попросил, можно честно показать "точного нет, но вот ближайшее") и у
-    background_internet_lookup (публикует в общий канал сам) разные
-    требования к строгости — по умолчанию строгий
-    mif_core.FUZZY_MATCH_THRESHOLD, для best-effort передай
-    mif_core.FUZZY_MATCH_FLOOR.
+    отсортированных по убыванию релевантности.
 
     ВАЖНО: этап 3 (обход категорий) ВСЕГДА требует как минимум
     mif_core.FUZZY_MATCH_THRESHOLD, даже если вызывающий код просил более
@@ -396,7 +373,7 @@ async def search_catalog(
     Кидает CatalogBlockedError, если категории (этап 3) явно отвечают 403
     (не "страницы нет", а "в доступе отказано").
     """
-    translated = await asyncio.to_thread(_translate_to_english, query)
+    translated = await asyncio.to_thread(mif_core.translate_to_english, query)
     query_variants = [query] + ([translated] if translated else [])
     logger.info("Поиск на MyInstants: запрос=%r, варианты для сравнения=%r", query, query_variants)
 
@@ -413,10 +390,24 @@ async def search_catalog(
         if best_score >= stage_min_score:
             candidates.append((best_score, sound))
 
-    # Этап 1: JSON API.
-    for variant in query_variants:
-        for sound in await _fetch_api_search(session, variant):
+    # Этап 1: JSON API — оба варианта запроса ОДНОВРЕМЕННО, не по очереди.
+    api_results_per_variant = await asyncio.gather(
+        *(_fetch_api_search(session, variant) for variant in query_variants)
+    )
+    for sounds in api_results_per_variant:
+        for sound in sounds:
             consider(sound, min_score)
+
+    if fast_only:
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
+        logger.info(
+            "Быстрый поиск (только API) для «%s»: %d кандидатов ≥%.0f (лучший: %s)",
+            query,
+            len(candidates),
+            min_score,
+            f"{candidates[0][0]:.0f} «{candidates[0][1]['title']}»" if candidates else "нет",
+        )
+        return candidates[:max_results]
 
     # Этап 2 (резерв): HTML-поиск сайта — только если API не дал ничего
     # выше порога.
@@ -494,7 +485,7 @@ def download_audio(session: requests.Session, url: str) -> bytes:
     # raise_for_status() пропускает 200 OK — а капча/блок-страница Cloudflare
     # обычно ПРИХОДИТ именно с кодом 200, просто с HTML вместо файла.
     # Проверяем первые байты содержимого — надёжнее, чем гадать по невнятной
-# ошибке ffmpeg или DOCUMENT_INVALID от Telegram тремя шагами позже.
+    # ошибке ffmpeg или DOCUMENT_INVALID от Telegram тремя шагами позже.
     head = audio_bytes[:512].lstrip().lower()
     if head.startswith((b"<!doctype", b"<html", b"<?xml")) or b"<head" in head[:200]:
         raise NotAudioContentError(content_type, audio_bytes[:200])
@@ -524,17 +515,6 @@ async def import_sound(
             logger.exception("Пропускаю (не удалось подготовить аудио): %s", title)
             return False
 
-        if content_hash:
-            duplicate = mif_core.find_duplicate_by_hash(content_hash)
-            if duplicate is not None:
-                logger.info(
-                    "Пропуск повторки по хэшу: «%s» совпадает с «%s»",
-                    title,
-                    duplicate.get("title", "без названия"),
-                )
-                existing_titles.add(title.lower())
-                return False
-
         displayed_bot_text = bot_text or "Речь не распознана."
         base_caption = (
             "<b>MIF с MyInstants</b>\n\n"
@@ -545,7 +525,7 @@ async def import_sound(
             f"<b>Источник:</b> {html.escape(sound['url'])}"
         )
 
-        await mif_core.publish_voice_mif(
+        status, _ = await mif_core.publish_voice_mif(
             bot,
             ogg_bytes=ogg_bytes,
             existing_voice_file_id=None,
@@ -557,6 +537,10 @@ async def import_sound(
             source_url=sound["url"],
         )
         existing_titles.add(title.lower())
+
+        if status == "duplicate":
+            logger.info("Пропуск повторки по звуку: «%s» уже есть в базе", title)
+            return False
 
         if transcription_error:
             logger.warning("Добавлен без авто-описания: %s — %s", title, transcription_error)

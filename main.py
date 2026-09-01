@@ -163,22 +163,6 @@ async def handle_description(message: Message, state: FSMContext) -> None:
         )
         return
 
-    # Обнаружение повторок: сравниваем хэш нормализованного звука со всеми
-    # уже сохранёнными. Разные битрейты/форматы одного и того же звука дадут
-    # одинаковый хэш, потому что хэшируем уже нормализованный WAV.
-    if content_hash:
-        duplicate = mif_core.find_duplicate_by_hash(content_hash)
-        if duplicate is not None:
-            await state.clear()
-            duplicate_title = duplicate.get("title") or "без названия"
-            await message.answer(
-                f"⚠️Такой звук уже есть в базе: «{duplicate_title}». "
-                "Повторно не публикую.\n"
-                "Если тебе кажется, что это ошибка — обрежь/измени файл немного "
-                "и пришли ещё раз."
-            )
-            return
-
     displayed_bot_description = bot_description or "Речь не распознана."
     author = message.from_user
     if author is None:
@@ -198,7 +182,7 @@ async def handle_description(message: Message, state: FSMContext) -> None:
     )
 
     try:
-        new_mif = await mif_core.publish_voice_mif(
+        status, new_mif = await mif_core.publish_voice_mif(
             message.bot,
             ogg_bytes=ogg_bytes,
             existing_voice_file_id=file_id if file_type == "voice" else None,
@@ -219,6 +203,21 @@ async def handle_description(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
+
+    if status == "duplicate":
+        # Проверка дубликата теперь атомарна внутри publish_voice_mif (под
+        # локом, вместе с самой публикацией) — это защищает от гонки, когда
+        # /loads или фоновый автопоиск публикуют тот же звук почти
+        # одновременно с ручной загрузкой.
+        duplicate_title = new_mif.get("title") or "без названия"
+        await message.answer(
+            f"⚠️Такой звук уже есть в базе: «{duplicate_title}». "
+            "Повторно не публикую.\n"
+            "Если тебе кажется, что это ошибка — обрежь/измени файл немного "
+            "и пришли ещё раз."
+        )
+        return
+
     if transcription_error:
         await message.answer(
             "✅Файл опубликован в @MIFFFKI и добавлен в поиск.\n"
@@ -295,16 +294,17 @@ async def search_mifs(query: InlineQuery) -> None:
         is_personal=True,
     )
 
-    # Локальный поиск дал слабое совпадение (или вообще ничего) — пробуем
-    # найти звук на MyInstants в фоне. НЕ делаем это до query.answer() и не
-    # ждём результата здесь: инлайн-ответ Telegram должен прийти быстро, а
+    # Локальный поиск дал слабое совпадение (или вообще ничего) — планируем
+    # фоновый поиск на MyInstants через debounce (не запускаем сразу: пока
+    # человек печатает запрос по буквам, инлайн-событие прилетает на каждое
+    # изменение текста — schedule_background_lookup сама разберётся, когда
+    # печатать закончили). НЕ делаем это до query.answer() и не ждём
+    # результата здесь: инлайн-ответ Telegram должен прийти быстро, а
     # скачивание+конвертация+публикация занимают секунды. Если получится —
     # mif_loader сам пришлёт находку личным сообщением автору запроса.
     query_text = query.query.strip()
     if query_text and best_score < mif_core.FUZZY_MATCH_THRESHOLD:
-        asyncio.create_task(
-            mif_loader.background_internet_lookup(query.bot, query.from_user.id, query_text)
-        )
+        mif_loader.schedule_background_lookup(query.bot, query.from_user.id, query_text)
 
 
 async def main() -> None:
@@ -326,4 +326,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

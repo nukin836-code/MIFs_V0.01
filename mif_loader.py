@@ -17,6 +17,7 @@ import html
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import requests
@@ -59,6 +60,49 @@ class LoaderState:
 
 loader_state = LoaderState()
 
+# Инлайн-запрос улетает боту на КАЖДОЕ изменение текста, пока человек
+# печатает буква за буквой — наивно запускать фоновый поиск на каждое из
+# них. Вместо кулдауна используем настоящий debounce: на каждое новое
+# слабое инлайн-совпадение взводим таймер на DEBOUNCE_DELAY_SECONDS; если
+# за это время прилетает более новый запрос от того же человека — старый
+# таймер отменяется, взводится новый. Поиск реально стартует только когда
+# человек перестал печатать (таймер достоялся до конца). Раз это точнее
+# решает саму причину (спам на каждую букву), отдельный кулдаун поверх
+# больше не нужен — а параллельные срабатывания от РАЗНЫХ людей на похожий
+# запрос уже защищены атомарной проверкой дубликата в
+# mif_core.publish_voice_mif (лок), а не через это.
+DEBOUNCE_DELAY_SECONDS = 0.3
+_pending_debounce_tasks: dict[int, asyncio.Task] = {}
+
+
+def schedule_background_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
+    """Взводит (или перезапускает) debounce-таймер для фонового поиска.
+    Сама ничего не ищет — только планирует запуск через
+    DEBOUNCE_DELAY_SECONDS, если за это время не прилетит более новый
+    запрос от того же человека (тогда этот таймер отменяется и заводится
+    новый — см. _debounced_lookup)."""
+    existing_task = _pending_debounce_tasks.get(requester_id)
+    if existing_task is not None and not existing_task.done():
+        existing_task.cancel()
+
+    _pending_debounce_tasks[requester_id] = asyncio.create_task(
+        _debounced_lookup(bot, requester_id, query_text)
+    )
+
+
+async def _debounced_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
+    try:
+        await asyncio.sleep(DEBOUNCE_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        # Прилетел более новый запрос, и его обработчик отменил именно этот
+        # таймер специально (см. schedule_background_lookup) — это не
+        # ошибка, просто тихо выходим, не запуская поиск для устаревшего
+        # текста.
+        return
+
+    _pending_debounce_tasks.pop(requester_id, None)
+    await background_internet_lookup(bot, requester_id, query_text)
+
 
 async def import_one_sound(
     bot: Bot,
@@ -94,11 +138,6 @@ async def import_one_sound(
         await mif_core.report_bug(bot, f"Автозагрузка: не удалось обработать «{title}»: {error}")
         return "error", None
 
-    if content_hash:
-        duplicate = mif_core.find_duplicate_by_hash(content_hash)
-        if duplicate is not None:
-            return "duplicate", duplicate
-
     displayed_bot_text = bot_text or "Речь не распознана."
     base_caption = (
         "<b>MIF с MyInstants (автозагрузка)</b>\n\n"
@@ -108,7 +147,7 @@ async def import_one_sound(
     )
 
     try:
-        new_mif = await mif_core.publish_voice_mif(
+        status, new_mif = await mif_core.publish_voice_mif(
             bot,
             ogg_bytes=ogg_bytes,
             existing_voice_file_id=None,
@@ -125,18 +164,17 @@ async def import_one_sound(
         )
         return "error", None
 
-    if transcription_error:
+    if status == "added" and transcription_error:
         logger.warning("Добавлен без авто-описания: %s — %s", title, transcription_error)
 
-    return "added", new_mif
+    return status, new_mif
 
 
 async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> None:
     session = requests.Session()
     session.headers.update(importer.MYINSTANTS_HEADERS)
     pager = importer.CatalogPager()
-
-    try:
+    y:
         while not loader_state.stop_event.is_set():
             if target_count is not None and loader_state.added_count >= target_count:
                 break
@@ -339,9 +377,24 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     публикуем его (через тот же import_one_sound/publish_voice_mif, что и
     везде) и присылаем автору запроса личным сообщением.
 
-    ВАЖНО: это не может попасть в тот же самый инлайн-ответ — Telegram не
-    ждёт секунды сканирования+скачивания+конвертации на инлайн-запрос,
-    результат обязательно приходит отдельным сообщением позже.
+    Разделено на быструю и медленную части намеренно:
+    1. Быстрая: "🔍Ищу в интернете..." → только API-поиск (search_catalog
+       с fast_only=True, оба варианта запроса параллельно) →
+       "✅Нашёл"/"⚠️Не нашёл". Реалистично 1-3 секунды в обычном случае.
+    2. Медленная (только если нашёл): скачать → сконвертировать →
+       опубликовать → прислать сам файл. Это реально занимает несколько
+       секунд ещё — скачивание, ffmpeg, распознавание речи, загрузка в
+       Telegram — тут нечего ускорять без потери в качестве. Разделение
+       специально: подтверждение "нашёл/не нашёл" быстрое, а не всё целиком.
+
+    ВАЖНО: результат не может попасть в тот же самый инлайн-ответ — как
+    только Telegram показал инлайн-подсказки, дополнить их позже нельзя,
+    результат обязательно приходит отдельными сообщениями в личку.
+
+    ВЫЗЫВАТЬ НЕ НАПРЯМУЮ, а через schedule_background_lookup — эта функция
+    сама не знает про debounce, ждёт вызова "прямо сейчас, точно финальный
+    запрос". Защита от спама на каждую букву во время печати живёт в
+    schedule_background_lookup, не здесь.
 
     ТАКЖЕ ВАЖНО: сработает, только если requester_id уже хотя бы раз писал
     боту (/start) — Telegram не разрешает ботам первыми писать пользователю.
@@ -349,52 +402,77 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     так уже получил обычный (пустой/слабый) инлайн-ответ.
     """
     try:
-        session = requests.Session()
-        session.headers.update(importer.MYINSTANTS_HEADERS)
-
-        # Явно строгий порог (не FUZZY_MATCH_FLOOR, как у /loadsSearch) — это
-        # публикуется в общий канал автоматически, без человека, который мог
-        # бы сам решить "ну и ладно, похоже". Слабое совпадение здесь просто
-        # тихо ничего не находит, а не тащит в архив что попало.
-        candidates = await importer.search_catalog(
-            session, query_text, max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD
-        )
-        if not candidates:
-            return
-
-        _, sound = candidates[0]
-
-        existing = mif_core.find_duplicate_by_title(sound["title"])
-        if existing is not None:
-            await bot.send_message(
-                requester_id, f"Кстати, по запросу «{query_text}» — «{sound['title']}» уже есть:"
-            )
-            await bot.send_voice(requester_id, voice=existing["file_id"])
-            return
-
-        status, entry = await import_one_sound(bot, session, sound)
-        if status != "added" or entry is None:
-            return
-
-        await bot.send_message(
-            requester_id,
-            f"🔎По запросу «{query_text}» не нашлось в архиве, но нашёл на MyInstants "
-            f"и добавил: «{entry['title']}». Уже доступен в поиске:",
-        )
-        await bot.send_voice(requester_id, voice=entry["file_id"])
+        await bot.send_message(requester_id, "🔍Ищу в интернете...")
     except TelegramAPIError:
-        # Скорее всего, requester_id никогда не писал боту — Telegram не
-        # даёт ботам первыми начинать личный чат. Звук при этом мог уже
-        # успеть опубликоваться и попасть в базу — это не потеря, просто
-        # человек не узнает о находке лично, увидит её в обычном поиске.
+        # requester_id никогда не писал боту — Telegram не даёт ботам
+        # первыми начинать личный чат. Дальше пытаться нет смысла: ни одно
+        # следующее сообщение всё равно не дойдёт.
         logger.info(
-            "Не удалось написать пользователю %s о находке по запросу «%s» "
-            "(возможно, он не начинал чат с ботом)",
+            "Не удалось начать фоновый поиск для %s (возможно, не начинал чат с ботом)",
             requester_id,
+        )
+        return
+
+    session = requests.Session()
+    session.headers.update(importer.MYINSTANTS_HEADERS)
+
+    try:
+        # fast_only=True — только API, без HTML-поиска и обхода категорий:
+        # это часть, которая должна быть быстрой (см. докстринг выше).
+        # Явно строгий порог (не FUZZY_MATCH_FLOOR, как у /loadsSearch) —
+        # публикуется в общий канал автоматически, без человека, который мог
+        # бы сам решить "ну и ладно, похоже".
+        candidates = await importer.search_catalog(
+            session,
             query_text,
+            max_results=1,
+            min_score=mif_core.FUZZY_MATCH_THRESHOLD,
+            fast_only=True,
         )
     except Exception:
-        logger.exception("Фоновый поиск на MyInstants упал для запроса «%s»", query_text)
+        logger.exception("Быстрый фоновый поиск на MyInstants упал для запроса «%s»", query_text)
+        await _try_send_message(bot, requester_id, f"⚠️Не нашёл: «{query_text}»")
+        return
+
+    if not candidates:
+        await _try_send_message(bot, requester_id, f"⚠️Не нашёл: «{query_text}»")
+        return
+
+    _, sound = candidates[0]
+
+    existing = mif_core.find_duplicate_by_title(sound["title"])
+    if existing is not None:
+        await _try_send_message(bot, requester_id, f"✅Нашёл: «{query_text}» — уже есть в базе:")
+        await _try_send_voice(bot, requester_id, existing["file_id"])
+        return
+
+    await _try_send_message(bot, requester_id, f"✅Нашёл: «{query_text}» — публикую в базу...")
+
+    # Дальше — медленная часть: скачивание, конвертация, публикация.
+    try:
+        status, entry = await import_one_sound(bot, session, sound)
+    except Exception:
+        logger.exception("Публикация после фонового поиска упала для запроса «%s»", query_text)
+        return
+
+    if status != "added" or entry is None:
+        return
+
+    await _try_send_voice(bot, requester_id, entry["file_id"])
+
+
+async def _try_send_message(bot: Bot, chat_id: int, text: str) -> None:
+    try:
+        await bot.send_message(chat_id, text)
+    except TelegramAPIError:
+        logger.info("Не удалось отправить сообщение пользователю %s", chat_id)
+
+
+async def _try_send_voice(bot: Bot, chat_id: int, file_id: str) -> None:
+    try:
+        await bot.send_voice(chat_id, voice=file_id)
+    except TelegramAPIError:
+        logger.info("Не удалось отправить голосовое пользователю %s", chat_id)
 
 
 async def handle_loads_commands(message: Message) -> None:
@@ -431,4 +509,3 @@ async def handle_loads_commands(message: Message) -> None:
         "/loadsStop — остановить\n"
         '/loadsSearch "запрос" — найти и загрузить конкретный звук'
     )
-    
