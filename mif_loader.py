@@ -459,7 +459,6 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
         return
 
     await _try_edit_message(bot, requester_id, f"✅ Нашёл: «{sound['title']}» — публикую...")
-requester_id, f"✅Нашёл: «{query_text}» — публикую в базу...")
 
     # Дальше — медленная часть: скачивание, конвертация, публикация.
     try:
