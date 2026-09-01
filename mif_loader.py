@@ -453,7 +453,7 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     _, sound = candidates[0]
 
     existing = mif_core.find_duplicate_by_title(sound["title"])
-        if existing is not None:
+    if existing is not None:
         await _try_edit_message(bot, requester_id, f"✅ Нашёл: «{sound['title']}» (уже в базе)")
         await _try_send_voice(bot, requester_id, existing["file_id"])
         return
