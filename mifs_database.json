@@ -4386,5 +4386,50 @@
     "channel_message_id": 414,
     "content_hash": "3680dc8adb54c6b330643807b3db8dfc5fda34a45c22abd165ba07b993b7387a",
     "source_url": "https://www.myinstants.com/media/sounds/mamu-tvoiu-v-kanavu.mp3"
+  },
+  {
+    "id": "298",
+    "title": "ПОТНЫЕ ТРУСЫ",
+    "file_id": "AwACAgIAAyEGAAMBAAHYslQAAgG7apdZVnafVyJC2ZYH0Eq4g-jhM2gAAqSjAAIuUrlIWbzenZtimw49BA",
+    "file_type": "voice",
+    "media_type": "voice",
+    "user_description": "ПОТНЫЕ ТРУСЫ",
+    "bot_description": "Доброе утро тебе",
+    "user_tags": "потные трусы",
+    "bot_tags": "доброе утро тебе",
+    "tags": "потные трусы",
+    "channel_message_id": 443,
+    "content_hash": "f66fb688f51e1758927aa14378bbd6f32f35b9bfc51b64dd4f381d1db23ef5ca",
+    "source_url": "https://www.myinstants.com/media/sounds/potnye-trusy.mp3"
+  },
+  {
+    "id": "299",
+    "title": "Потный мужик стонет",
+    "file_id": "AwACAgIAAyEGAAMBAAHYslQAAgG8apdZVvMPsnYxkJYSSgew6agRwBMAAqWjAAIuUrlI8uaxVOD0jic9BA",
+    "file_type": "voice",
+    "media_type": "voice",
+    "user_description": "Потный мужик стонет",
+    "bot_description": "",
+    "user_tags": "потный мужик стонет",
+    "bot_tags": "",
+    "tags": "потный мужик стонет",
+    "channel_message_id": 444,
+    "content_hash": "c8bb4b8216845b4eb95194edfde0dd0ba4e3049a8b92237890bc28cc98831e21",
+    "source_url": "https://www.myinstants.com/media/sounds/potnyi-muzhik-stonet.mp3"
+  },
+  {
+    "id": "300",
+    "title": "Sweaty balls",
+    "file_id": "AwACAgIAAyEGAAMBAAHYslQAAgG9apdZV7oCQkxmMtrie1GDRIEqD0gAAqajAAIuUrlIZF9tDtPijqA9BA",
+    "file_type": "voice",
+    "media_type": "voice",
+    "user_description": "Sweaty balls",
+    "bot_description": "",
+    "user_tags": "sweaty balls",
+    "bot_tags": "",
+    "tags": "sweaty balls",
+    "channel_message_id": 445,
+    "content_hash": "a9c39d9444308f689b5f4fe5f7b6031b8f7c1e6b99b54285940ca9996dcbc24d",
+    "source_url": "https://www.myinstants.com/media/sounds/sweaty-balls.mp3"
   }
 ]
