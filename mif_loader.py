@@ -61,58 +61,33 @@ class LoaderState:
 loader_state = LoaderState()
 
 # Инлайн-запрос улетает боту на КАЖДОЕ изменение текста, пока человек
-# печатает буква за буквой. Защита в два слоя:
-#
-# 1. DEBOUNCE (до старта поиска): на каждое новое слабое инлайн-совпадение
-#    взводим таймер на DEBOUNCE_DELAY_SECONDS; если за это время прилетает
-#    более новый запрос от того же человека — старый таймер отменяется,
-#    взводится новый. Это ловит "печатает быстро, ещё не остановился".
-#
-# 2. IN-FLIGHT GUARD (пока поиск уже идёт): сам поиск — это не 300 мс, а
-#    реально несколько секунд (перевод, запрос к MyInstants, скачивание,
-#    конвертация). Пока он выполняется, таймер из пункта 1 уже не активен —
-#    отменять нечего, и без этого слоя каждая буква, напечатанная ПОКА идёт
-#    предыдущий поиск, запускала бы свой отдельный, независимый поиск (это
-#    и произошло на практике — три параллельных "Готово" на один и тот же
-#    печатаемый текст). Поэтому: пока для человека уже что-то ищется,
-#    новые запросы не запускают поиск, а просто запоминаются как "самый
-#    свежий текст"; как только текущий поиск завершится — если текст с тех
-#    пор менялся, запускается ровно ОДИН новый цикл (снова через debounce)
-#    для последнего известного значения, а не по одному на каждое
-#    промежуточное.
-#
-# Параллельные срабатывания от РАЗНЫХ людей на похожий запрос защищены
-# отдельно — атомарной проверкой дубликата в mif_core.publish_voice_mif
-# (лок), не этим механизмом.
+# печатает буква за буквой — наивно запускать фоновый поиск на каждое из
+# них. Вместо кулдауна используем настоящий debounce: на каждое новое
+# слабое инлайн-совпадение взводим таймер на DEBOUNCE_DELAY_SECONDS; если
+# за это время прилетает более новый запрос от того же человека — старый
+# таймер отменяется, взводится новый. Поиск реально стартует только когда
+# человек перестал печатать (таймер достоялся до конца). Раз это точнее
+# решает саму причину (спам на каждую букву), отдельный кулдаун поверх
+# больше не нужен — а параллельные срабатывания от РАЗНЫХ людей на похожий
+# запрос уже защищены атомарной проверкой дубликата в
+# mif_core.publish_voice_mif (лок), а не через это.
 DEBOUNCE_DELAY_SECONDS = 0.3
-
-
-class _UserLookupState:
-    def __init__(self) -> None:
-        self.debounce_task: asyncio.Task | None = None
-        self.in_flight: bool = False
-        self.latest_pending_query: str | None = None
-
-
-_user_lookup_states: dict[int, _UserLookupState] = {}
+_pending_debounce_tasks: dict[int, asyncio.Task] = {}
 
 
 def schedule_background_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
-    """Планирует фоновый поиск с учётом обоих слоёв защиты выше. Сама
-    ничего не ищет напрямую."""
-    state = _user_lookup_states.setdefault(requester_id, _UserLookupState())
+    """Взводит (или перезапускает) debounce-таймер для фонового поиска.
+    Сама ничего не ищет — только планирует запуск через
+    DEBOUNCE_DELAY_SECONDS, если за это время не прилетит более новый
+    запрос от того же человека (тогда этот таймер отменяется и заводится
+    новый — см. _debounced_lookup)."""
+    existing_task = _pending_debounce_tasks.get(requester_id)
+    if existing_task is not None and not existing_task.done():
+        existing_task.cancel()
 
-    if state.in_flight:
-        # Уже что-то ищем/публикуем для этого человека прямо сейчас — не
-        # запускаем вторую параллельную попытку, просто запоминаем самый
-        # свежий текст на потом (см. _debounced_lookup).
-        state.latest_pending_query = query_text
-        return
-
-    if state.debounce_task is not None and not state.debounce_task.done():
-        state.debounce_task.cancel()
-
-    state.debounce_task = asyncio.create_task(_debounced_lookup(bot, requester_id, query_text))
+    _pending_debounce_tasks[requester_id] = asyncio.create_task(
+        _debounced_lookup(bot, requester_id, query_text)
+    )
 
 
 async def _debounced_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
@@ -125,21 +100,8 @@ async def _debounced_lookup(bot: Bot, requester_id: int, query_text: str) -> Non
         # текста.
         return
 
-    state = _user_lookup_states[requester_id]
-    state.debounce_task = None
-    state.in_flight = True
-    try:
-        await background_internet_lookup(bot, requester_id, query_text)
-    finally:
-        state.in_flight = False
-
-    # Пока искали, могли прилететь более новые запросы (см. in-flight guard
-    # выше) — если да, запускаем ОДИН новый цикл для самого свежего из них,
-    # а не по одному на каждое промежуточное значение.
-    next_query = state.latest_pending_query
-    state.latest_pending_query = None
-    if next_query is not None:
-        schedule_background_lookup(bot, requester_id, next_query)
+    _pending_debounce_tasks.pop(requester_id, None)
+    await background_internet_lookup(bot, requester_id, query_text)
 
 
 async def import_one_sound(
@@ -333,7 +295,8 @@ async def handle_loads_search(message: Message, query: str) -> None:
     if not query:
         await message.answer('Укажи запрос: /loadsSearch "текст".')
         return
-            # Раньше почти всегда срабатывал медленный обход категорий (5-15 сек),
+
+    # Раньше почти всегда срабатывал медленный обход категорий (5-15 сек),
     # теперь в норме отвечает JSON API за секунду-две — обход категорий
     # остаётся редким финальным резервом, а не обычным путём. Отдельное
     # "подожди, это долго" сообщение больше не нужно как правило; если
