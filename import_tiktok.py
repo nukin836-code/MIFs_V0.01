@@ -2,8 +2,9 @@ import asyncio
 import difflib
 import logging
 from urllib.parse import quote_plus
-
+import re
 import requests
+from bs4 import BeautifulSoup
 from aiogram import Bot
 
 import mif_core
@@ -23,103 +24,130 @@ async def search_catalog(
     bot: Bot | None = None
 ) -> list[tuple[int, dict[str, str]]]:
     """
-    Ищет звуки в TikTok через tikwm API и кидает баг-репорты при любых отклонениях.
+    Эмулирует поиск TikTok через веб-интерфейс и находит прямые ссылки на видео.
     """
-    url = f"https://www.tikwm.com/api/feed/search?keywords={quote_plus(query)}&count=10"
+    logger.info("Пробуем искать в TikTok (веб-поиск) запрос: «%s»", query)
+    
+    # Используем публичный поиск или поисковые выдачи, чтобы найти ссылки на видео
+    search_url = f"https://www.tiktok.com/search?q={quote_plus(query)}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.9",
+    }
     
     try:
-        response = await asyncio.to_thread(session.get, url, timeout=10)
-        
-        # 1. Проверка HTTP статуса
+        response = await asyncio.to_thread(session.get, search_url, headers=headers, timeout=10)
         if response.status_code != 200:
-            error_text = f"TikTok API ответил кодом {response.status_code}. Тело: {response.text[:100]}"
-            logger.error(error_text)
-            if bot:
-                await mif_core.report_bug(bot, f"⚠️ import_tiktok: {error_text}\nURL: {url}")
-            return []
-
-        # 2. Проверка валидности JSON
-        try:
-            data = response.json()
-        except Exception as e:
-            error_text = f"TikTok API вернул не JSON (возможно, капча Cloudflare): {response.text[:100]}"
-            logger.error(error_text)
-            if bot:
-                await mif_core.report_bug(bot, f"⚠️ import_tiktok: {error_text}")
-            return []
-        
-        # 3. Проверка внутренней структуры ответа
-        if data.get("code") != 0 or "data" not in data or "videos" not in data["data"]:
-            error_text = f"Неожиданный формат ответа: {data.get('msg', 'отсутствует ключ videos')}"
-            logger.warning(error_text)
-            if bot:
-                await mif_core.report_bug(bot, f"⚠️ import_tiktok: {error_text}\nЗапрос: {query}")
             return []
             
+        # Парсим страницы TikTok в поисках ссылок на видео /video/... или vt.tiktok.com
+        soup = BeautifulSoup(response.text, 'html.parser')
+        video_links = set()
+        
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if "/video/" in href or "vt.tiktok.com" in href:
+                if not href.startswith("http"):
+                    href = "https://www.tiktok.com" + href
+                video_links.add(href)
+                
         results = []
-        seen_urls = set()
-        
-        for video in data["data"]["videos"]:
-            video_title = video.get("title", "")
-            music_info = video.get("music_info", {})
-            music_title = music_info.get("title", "")
+        for i, link in enumerate(list(video_links)[:max_results]):
+            # В качестве названия пока берем запрос + индекс, так как спарсить тайтлы со страницы сложно без Selenium
+            display_title = f"{query} (TikTok #{i+1})"
             
-            audio_url = video.get("music") or music_info.get("play")
-            if not audio_url:
-                continue
-                
-            if audio_url in seen_urls:
-                continue
-            seen_urls.add(audio_url)
-            
-            clean_video_title = video_title.split("#")[0].strip()[:50]
-            display_title = clean_video_title
-            if music_title and music_title.lower() not in display_title.lower():
-                display_title = f"{display_title} 🎵 {music_title[:30]}"
-                
-            if not display_title:
-                display_title = query
-                
             ratio = difflib.SequenceMatcher(None, query.lower(), display_title.lower()).ratio()
             score = int(ratio * 100)
-            
-            base_boost = max(0, 95 - len(results) * 5)
-            final_score = max(score, base_boost)
+            final_score = max(score, 90 - i * 5) # Искусственный буст для топа выдачи
             
             if final_score >= min_score:
                 results.append((final_score, {
-                    "title": display_title.strip(),
-                    "url": audio_url
+                    "title": display_title,
+                    "url": link  # Сохраняем саму ссылку на TikTok видео
                 }))
                 
-                if len(results) >= max_results:
-                    break
-                    
-        results.sort(key=lambda x: x[0], reverse=True)
         return results
-        
     except Exception as e:
-        logger.exception("Критическая ошибка поиска в TikTok API: %s", e)
+        logger.error("Ошибка при эмуляции поиска TikTok: %s", e)
         if bot:
-            await mif_core.report_bug(bot, f"🚨 Критическая ошибка в import_tiktok.search_catalog:\nЗапрос: {query}\nОшибка: {type(e).__name__} - {e}")
+            await mif_core.report_bug(bot, f"⚠️ import_tiktok search error: {e}")
         return []
 
-def download_audio(session: requests.Session, tiktok_url: str) -> bytes:
+def download_audio(session: requests.Session, tiktok_page_url: str) -> bytes:
     """
-    Здесь баг-репорты отправлять напрямую нельзя (функция синхронная для asyncio.to_thread).
-    Мы просто прокидываем ошибку наверх — mif_loader.py сам перехватит её в import_one_sound 
-    и отправит баг-репорт с точным URL.
+    Берет ссылку на TikTok видео, стучится на ssstik.io, забирает прямую ссылку на MP3 
+    (через tikcdn или аналогичные хосты) и скачивает аудиобайты.
     """
-    response = session.get(tiktok_url, timeout=15)
-    response.raise_for_status()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "HX-Request": "true",
+        "HX-Current-URL": "https://ssstik.io/ru",
+        "Origin": "https://ssstik.io",
+        "Referer": "https://ssstik.io/ru",
+    }
     
-    content_type = response.headers.get("Content-Type", "").lower()
+    # 1. Запрос к ssstik для получения формы и токенов загрузки
+    post_url = "https://ssstik.io/abc?url=dl"
+    data = {
+        "id": tiktok_page_url,
+        "locale": "ru",
+        "tt": "" # Параметры сессии ssstik
+    }
     
-    if "text" in content_type or "html" in content_type:
-        raise NotAudioContentError(
-            f"Вместо аудио пришла веб-страница. TikTok заблокировал скачивание.", 
-            content_type=content_type
-        )
+    try:
+        resp = session.post(post_url, data=data, headers=headers, timeout=15)
+        resp.raise_for_status()
         
-    return response.content
-    
+        # 2. Парсим HTML-ответ от ssstik, где спрятана ссылка на скачивание MP3/видео
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        # Ищем кнопку/ссылку на скачивание аудио (mp3)
+        mp3_link = None
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            # Обычно ссылки на аудио содержат маркеры mp3 или ведут на tikcdn / ssstik c аудио
+            if "dl" in href or "mp3" in href or "tikcdn" in href:
+                if "download" in a.text.lower() or "mp3" in a.text.lower() or "аудио" in a.text.lower():
+                    mp3_link = href
+                    break
+                    
+        # Если явную кнопку MP3 не нашли, берем первую попавшуюся прямую ссылку на медиафайл
+        if not mp3_link:
+            for a in soup.find_all('a', href=True):
+                if "tikcdn" in a['href'] or ".mp4" in a['href'] or ".mp3" in a['href']:
+                    mp3_link = a['href']
+                    break
+                    
+        if not mp3_link:
+            raise NotAudioContentError("Не удалось извлечь прямую ссылку на MP3 из ответов ssstik.")
+            
+        if not mp3_link.startswith("http"):
+            mp3_link = "https:" + mp3_link if mp3_link.startswith("//") else "https://ssstik.io" + mp3_link
+
+        # 3. Скачиваем финальный медиафайл (который пойдет в мясорубку mif_core)
+        audio_resp = session.get(mp3_link, timeout=20)
+        audio_resp.raise_for_status()
+        
+        content_type = audio_resp.headers.get("Content-Type", "").lower()
+        if "text" in content_type or "html" in content_type:
+            raise NotAudioContentError("Скачался не аудиофайл, а страница с ошибкой/капчей.", content_type=content_type)
+            
+        return audio_resp.content
+
+    except Exception as e:
+        logger.error("Ошибка скачивания через ssstik для %s: %s", tiktok_page_url, e)
+        raise
+         # 3. Скачиваем финальный медиафайл (который пойдет в мясорубку mif_core)
+        audio_resp = session.get(mp3_link, timeout=20)
+        audio_resp.raise_for_status()
+        
+        content_type = audio_resp.headers.get("Content-Type", "").lower()
+        if "text" in content_type or "html" in content_type:
+            raise NotAudioContentError("Скачался не аудиофайл, а страница с ошибкой/капчей.", content_type=content_type)
+            
+        return audio_resp.content
+
+    except Exception as e:
+        logger.error("Ошибка скачивания через ssstik для %s: %s", tiktok_page_url, e)
+        raise
