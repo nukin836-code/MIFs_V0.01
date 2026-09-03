@@ -4,6 +4,9 @@ import logging
 from urllib.parse import quote_plus
 
 import requests
+from aiogram import Bot
+
+import mif_core
 
 logger = logging.getLogger("mif-bot.tiktok")
 
@@ -16,23 +19,41 @@ async def search_catalog(
     session: requests.Session, 
     query: str, 
     min_score: int = 0, 
-    max_results: int = 5
+    max_results: int = 5,
+    bot: Bot | None = None
 ) -> list[tuple[int, dict[str, str]]]:
     """
-    Ищет звуки в TikTok.
-    Так как TikTok активно блокирует прямые запросы от ботов (капчи, токены X-Bogus),
-    здесь используется бесплатный неофициальный API (tikwm.com), который отдает 
-    прямые ссылки на mp3/mp4 без водяных знаков и не требует авторизации.
+    Ищет звуки в TikTok через tikwm API и кидает баг-репорты при любых отклонениях.
     """
     url = f"https://www.tikwm.com/api/feed/search?keywords={quote_plus(query)}&count=10"
     
     try:
-        # Выполняем синхронный запрос в отдельном потоке, чтобы не блокировать event loop aiogram
         response = await asyncio.to_thread(session.get, url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
         
+        # 1. Проверка HTTP статуса
+        if response.status_code != 200:
+            error_text = f"TikTok API ответил кодом {response.status_code}. Тело: {response.text[:100]}"
+            logger.error(error_text)
+            if bot:
+                await mif_core.report_bug(bot, f"⚠️ import_tiktok: {error_text}\nURL: {url}")
+            return []
+
+        # 2. Проверка валидности JSON
+        try:
+            data = response.json()
+        except Exception as e:
+            error_text = f"TikTok API вернул не JSON (возможно, капча Cloudflare): {response.text[:100]}"
+            logger.error(error_text)
+            if bot:
+                await mif_core.report_bug(bot, f"⚠️ import_tiktok: {error_text}")
+            return []
+        
+        # 3. Проверка внутренней структуры ответа
         if data.get("code") != 0 or "data" not in data or "videos" not in data["data"]:
+            error_text = f"Неожиданный формат ответа: {data.get('msg', 'отсутствует ключ videos')}"
+            logger.warning(error_text)
+            if bot:
+                await mif_core.report_bug(bot, f"⚠️ import_tiktok: {error_text}\nЗапрос: {query}")
             return []
             
         results = []
@@ -43,7 +64,6 @@ async def search_catalog(
             music_info = video.get("music_info", {})
             music_title = music_info.get("title", "")
             
-            # API обычно отдает прямую ссылку на звук в поле music или внутри music_info
             audio_url = video.get("music") or music_info.get("play")
             if not audio_url:
                 continue
@@ -52,8 +72,7 @@ async def search_catalog(
                 continue
             seen_urls.add(audio_url)
             
-            # Формируем читаемое название: берем текст видео и, если есть, название трека
-            clean_video_title = video_title.split("#")[0].strip()[:50] # Отрезаем хештеги
+            clean_video_title = video_title.split("#")[0].strip()[:50]
             display_title = clean_video_title
             if music_title and music_title.lower() not in display_title.lower():
                 display_title = f"{display_title} 🎵 {music_title[:30]}"
@@ -61,13 +80,9 @@ async def search_catalog(
             if not display_title:
                 display_title = query
                 
-            # Оцениваем релевантность
             ratio = difflib.SequenceMatcher(None, query.lower(), display_title.lower()).ratio()
             score = int(ratio * 100)
             
-            # Выдача TikTok сама по себе релевантна запросу. Искусственно завышаем балл 
-            # первым результатам, чтобы они проходили строгий порог (FUZZY_MATCH_THRESHOLD) 
-            # при автоматическом фоновом поиске, даже если точного текстового совпадения нет.
             base_boost = max(0, 95 - len(results) * 5)
             final_score = max(score, base_boost)
             
@@ -80,28 +95,29 @@ async def search_catalog(
                 if len(results) >= max_results:
                     break
                     
-        # Сортируем от наиболее релевантных к наименее
         results.sort(key=lambda x: x[0], reverse=True)
         return results
         
     except Exception as e:
-        logger.error("Ошибка поиска в TikTok API: %s", e)
+        logger.exception("Критическая ошибка поиска в TikTok API: %s", e)
+        if bot:
+            await mif_core.report_bug(bot, f"🚨 Критическая ошибка в import_tiktok.search_catalog:\nЗапрос: {query}\nОшибка: {type(e).__name__} - {e}")
         return []
 
 def download_audio(session: requests.Session, tiktok_url: str) -> bytes:
     """
-    Скачивает сырые байты по прямой ссылке, полученной из API.
-    Вызывается в `mif_loader.py` через `asyncio.to_thread`.
+    Здесь баг-репорты отправлять напрямую нельзя (функция синхронная для asyncio.to_thread).
+    Мы просто прокидываем ошибку наверх — mif_loader.py сам перехватит её в import_one_sound 
+    и отправит баг-репорт с точным URL.
     """
     response = session.get(tiktok_url, timeout=15)
     response.raise_for_status()
     
     content_type = response.headers.get("Content-Type", "").lower()
     
-    # Защита от заглушек, страниц с капчей или ошибок серверов (HTML/Text вместо аудио)
     if "text" in content_type or "html" in content_type:
         raise NotAudioContentError(
-            f"Вместо медиафайла скачалась веб-страница.", 
+            f"Вместо аудио пришла веб-страница. TikTok заблокировал скачивание.", 
             content_type=content_type
         )
         
