@@ -23,32 +23,38 @@ async def search_catalog(
     bot: Bot | None = None
 ) -> list[tuple[int, dict[str, str]]]:
     """
-    Ищет TikTok через поисковик (DuckDuckGo HTML), находя реальные индексированные 
-    ссылки на ролики по запросу пользователя.
+    Ищет TikTok через DuckDuckGo Lite (без капч и блокировок).
     """
-    logger.info("Ищем TikTok через поисковик для запроса: «%s»", query)
+    logger.info("Ищем TikTok через DuckDuckGo Lite для запроса: «%s»", query)
     
-    # Ищем с приставкой tiktok, как ты и предложил
     search_query = f"tiktok {query}"
-    url = f"https://html.duckduckgo.com/html/?q={quote_plus(search_query)}"
+    # Используем lite-версию, она создана для простых клиентов и не требует сложных заголовков
+    url = "https://lite.duckduckgo.com/lite/"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Origin": "https://lite.duckduckgo.com",
+        "Referer": "https://lite.duckduckgo.com/",
+    }
+    data = {
+        "q": search_query,
+        "kl": ""
     }
     
     try:
-        response = await asyncio.to_thread(session.get, url, headers=headers, timeout=10)
+        response = await asyncio.to_thread(session.post, url, data=data, headers=headers, timeout=7)
         if response.status_code != 200:
+            logger.warning("DuckDuckGo Lite ответил статусом %s", response.status_code)
             return []
             
         soup = BeautifulSoup(response.text, 'html.parser')
         video_links = set()
         
-        # Парсим результаты поисковой выдачи и достаем оттуда ссылки на TikTok
+        # Парсим ссылки из lite-версии поисковика
         for a in soup.find_all('a', href=True):
             href = a['href']
             
-            # DuckDuckGo оборачивает ссылки в редиректы, вытаскиваем чистый URL
+            # В DuckDuckGo ссылки идут через редирект /l/?uddg=...
             if "uddg=" in href:
                 parsed_url = parse_qs(urlparse(href).query)
                 if "uddg" in parsed_url:
@@ -57,6 +63,8 @@ async def search_catalog(
             if "tiktok.com" in href and ("/video/" in href or "vt.tiktok.com" in href or "/@" in href):
                 video_links.add(href)
                 
+        logger.info("Найдено TikTok ссылок через поиск: %d", len(video_links))
+        
         results = []
         for i, link in enumerate(list(video_links)[:max_results]):
             display_title = f"{query} (TikTok #{i+1})"
@@ -68,20 +76,19 @@ async def search_catalog(
             if final_score >= min_score:
                 results.append((final_score, {
                     "title": display_title,
-                    "url": link  # Та самая чистая ссылка на TikTok
+                    "url": link
                 }))
                 
         return results
     except Exception as e:
-        logger.error("Ошибка при поиске TikTok через поисковик: %s", e)
+        logger.error("Ошибка при поиске TikTok через DDG Lite: %s", e)
         if bot:
             await mif_core.report_bug(bot, f"⚠️ import_tiktok search error: {e}")
         return []
 
 def download_audio(session: requests.Session, tiktok_page_url: str) -> bytes:
     """
-    Принимает найденную ссылку на TikTok, прогоняет через ssstik.io, 
-    вытаскивает прямую ссылку на медиафайл и скачивает его.
+    Скачивает аудиодорожку по найденной ссылке TikTok через ssstik.io.
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -99,7 +106,7 @@ def download_audio(session: requests.Session, tiktok_page_url: str) -> bytes:
     }
     
     try:
-        resp = session.post(post_url, data=data, headers=headers, timeout=15)
+        resp = session.post(post_url, data=data, headers=headers, timeout=10)
         resp.raise_for_status()
         
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -124,7 +131,7 @@ def download_audio(session: requests.Session, tiktok_page_url: str) -> bytes:
         if not mp3_link.startswith("http"):
             mp3_link = "https:" + mp3_link if mp3_link.startswith("//") else "https://ssstik.io" + mp3_link
 
-        audio_resp = session.get(mp3_link, timeout=20)
+        audio_resp = session.get(mp3_link, timeout=15)
         audio_resp.raise_for_status()
         
         content_type = audio_resp.headers.get("Content-Type", "").lower()
