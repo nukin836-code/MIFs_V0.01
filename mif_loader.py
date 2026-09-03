@@ -1,5 +1,5 @@
 """
-Автозагрузка звуков с MyInstants: /loads, /loadsN, /loadsStop, /loadsSearch.
+Автозагрузка звуков с TikTok и MyInstants: /loads, /loadsN, /loadsStop, /loadsSearch.
 
 Логика вынесена сюда отдельно от main.py, чтобы не раздувать файл с
 Telegram-хендлерами. main.py регистрирует @dp.message-хендлеры и просто
@@ -26,6 +26,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
 
 import import_myinstants as importer
+import import_tiktok
 import mif_core
 
 logger = logging.getLogger("mif-bot.loader")
@@ -35,12 +36,7 @@ logger = logging.getLogger("mif-bot.loader")
 LOADS_ADMIN_ID = int(os.getenv("LOADS_ADMIN_ID", "1297417116"))
 
 # Пауза между КАЖДОЙ попыткой (успешной, дублем или ошибкой) — не только
-# между успешными публикациями. Поднята с 2 до 5 секунд из-за flood control:
-# Telegram ограничивает число сообщений В ОДИН И ТОТ ЖЕ чат/канал в минуту, а
-# каждая публикация — это ДВА запроса к каналу (send_voice + правка подписи).
-# Дополнительно mif_core.publish_voice_mif сам умеет пережидать лимит по
-# точной подсказке Telegram, если он всё же сработает несмотря на паузу —
-# так что звук не потеряется, просто немного задержится.
+# между успешными публикациями.
 LOADS_STEP_DELAY_SECONDS = 5.0
 
 LOADS_SEARCH_RE = re.compile(r'^/loadsSearch\s+"?([^"]+?)"?\s*$')
@@ -60,30 +56,6 @@ class LoaderState:
 
 loader_state = LoaderState()
 
-# Инлайн-запрос улетает боту на КАЖДОЕ изменение текста, пока человек
-# печатает буква за буквой. Защита в два слоя:
-#
-# 1. DEBOUNCE (до старта поиска): на каждое новое слабое инлайн-совпадение
-#    взводим таймер на DEBOUNCE_DELAY_SECONDS; если за это время прилетает
-#    более новый запрос от того же человека — старый таймер отменяется,
-#    взводится новый. Это ловит "печатает быстро, ещё не остановился".
-#
-# 2. IN-FLIGHT GUARD (пока поиск уже идёт): сам поиск — это не 300 мс, а
-#    реально несколько секунд (перевод, запрос к MyInstants, скачивание,
-#    конвертация). Пока он выполняется, таймер из пункта 1 уже не активен —
-#    отменять нечего, и без этого слоя каждая буква, напечатанная ПОКА идёт
-#    предыдущий поиск, запускала бы свой отдельный, независимый поиск (это
-#    и произошло на практике — три параллельных "Готово" на один и тот же
-#    печатаемый текст). Поэтому: пока для человека уже что-то ищется,
-#    новые запросы не запускают поиск, а просто запоминаются как "самый
-#    свежий текст"; как только текущий поиск завершится — если текст с тех
-#    пор менялся, запускается ровно ОДИН новый цикл (снова через debounce)
-#    для последнего известного значения, а не по одному на каждое
-#    промежуточное.
-#
-# Параллельные срабатывания от РАЗНЫХ людей на похожий запрос защищены
-# отдельно — атомарной проверкой дубликата в mif_core.publish_voice_mif
-# (лок), не этим механизмом.
 DEBOUNCE_DELAY_SECONDS = 0.3
 
 
@@ -98,14 +70,10 @@ _user_lookup_states: dict[int, _UserLookupState] = {}
 
 
 def schedule_background_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
-    """Планирует фоновый поиск с учётом обоих слоёв защиты выше. Сама
-    ничего не ищет напрямую."""
+    """Планирует фоновый поиск с учётом двух слоёв защиты (debounce и in-flight)."""
     state = _user_lookup_states.setdefault(requester_id, _UserLookupState())
 
     if state.in_flight:
-        # Уже что-то ищем/публикуем для этого человека прямо сейчас — не
-        # запускаем вторую параллельную попытку, просто запоминаем самый
-        # свежий текст на потом (см. _debounced_lookup).
         state.latest_pending_query = query_text
         return
 
@@ -119,10 +87,6 @@ async def _debounced_lookup(bot: Bot, requester_id: int, query_text: str) -> Non
     try:
         await asyncio.sleep(DEBOUNCE_DELAY_SECONDS)
     except asyncio.CancelledError:
-        # Прилетел более новый запрос, и его обработчик отменил именно этот
-        # таймер специально (см. schedule_background_lookup) — это не
-        # ошибка, просто тихо выходим, не запуская поиск для устаревшего
-        # текста.
         return
 
     state = _user_lookup_states[requester_id]
@@ -133,9 +97,6 @@ async def _debounced_lookup(bot: Bot, requester_id: int, query_text: str) -> Non
     finally:
         state.in_flight = False
 
-    # Пока искали, могли прилететь более новые запросы (см. in-flight guard
-    # выше) — если да, запускаем ОДИН новый цикл для самого свежего из них,
-    # а не по одному на каждое промежуточное значение.
     next_query = state.latest_pending_query
     state.latest_pending_query = None
     if next_query is not None:
@@ -147,25 +108,28 @@ async def import_one_sound(
     session: requests.Session,
     sound: dict[str, str],
 ) -> tuple[str, dict[str, Any] | None]:
-    """Скачивает, обрабатывает и публикует один звук с MyInstants через
-    mif_core.publish_voice_mif. Возвращает
-    ('added' | 'duplicate' | 'error', запись_или_None)."""
+    """Скачивает, обрабатывает и публикует один звук с TikTok или MyInstants
+    через mif_core.publish_voice_mif. Возвращает ('added' | 'duplicate' | 'error', запись_или_None)."""
     title = sound["title"]
+    source_type = sound.get("source_type", "myinstants")
+    source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
 
     try:
-        audio_bytes = await asyncio.to_thread(importer.download_audio, session, sound["url"])
-    except importer.AudioTooLargeError:
+        if source_type == "tiktok":
+            audio_bytes = await asyncio.to_thread(import_tiktok.download_audio, session, sound["url"])
+        else:
+            audio_bytes = await asyncio.to_thread(importer.download_audio, session, sound["url"])
+    except getattr(importer, "AudioTooLargeError", Exception):
         return "error", None
-    except importer.NotAudioContentError as error:
+    except getattr(importer, "NotAudioContentError", Exception) as error:
         await mif_core.report_bug(
             bot,
-            f"Автозагрузка: MyInstants вернул не аудио для «{title}» "
-            f"(content-type={error.content_type!r}) — похоже на капчу/блокировку "
-            f"доступа, а не битый файл: {sound['url']}",
+            f"Автозагрузка ({source_label}): вернул не аудио для «{title}» "
+            f"(content-type={getattr(error, 'content_type', 'unknown')!r}) — {sound['url']}",
         )
         return "error", None
-    except requests.RequestException as error:
-        await mif_core.report_bug(bot, f"Автозагрузка: не удалось скачать «{title}»: {error}")
+    except Exception as error:
+        await mif_core.report_bug(bot, f"Автозагрузка ({source_label}): не удалось скачать «{title}»: {error}")
         return "error", None
 
     try:
@@ -173,12 +137,12 @@ async def import_one_sound(
             await mif_core.prepare_audio_from_bytes(audio_bytes)
         )
     except RuntimeError as error:
-        await mif_core.report_bug(bot, f"Автозагрузка: не удалось обработать «{title}»: {error}")
+        await mif_core.report_bug(bot, f"Автозагрузка ({source_label}): не удалось обработать «{title}»: {error}")
         return "error", None
 
     displayed_bot_text = bot_text or "Речь не распознана."
     base_caption = (
-        "<b>MIF с MyInstants (автозагрузка)</b>\n\n"
+        f"<b>MIF с {source_label} (автозагрузка)</b>\n\n"
         f"<b>Название и теги пользователя:</b> {html.escape(mif_core.clip_text(title))}\n"
         f"<b>Авто-описание от бота:</b> {html.escape(mif_core.clip_text(displayed_bot_text))}\n"
         f"<b>Источник:</b> {html.escape(sound['url'])}"
@@ -198,7 +162,7 @@ async def import_one_sound(
         )
     except TelegramAPIError as error:
         await mif_core.report_bug(
-            bot, f"Автозагрузка: Telegram отклонил публикацию «{title}»: {error}"
+            bot, f"Автозагрузка ({source_label}): Telegram отклонил публикацию «{title}»: {error}"
         )
         return "error", None
 
@@ -224,14 +188,11 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
                 sounds = importer.parse_page(page_html)
             except requests.HTTPError as error:
                 if error.response is not None and error.response.status_code in {404, 410}:
-                    # Эта категория на этой странице закончилась — идём в
-                    # следующую категорию, а не пытаемся листать бесконечно.
                     pager.advance_category()
                 else:
                     await mif_core.report_bug(
                         bot,
-                        f"Автозагрузка: категория «{pager.current_category}» "
-                        f"не загрузилась: {error}",
+                        f"Автозагрузка: категория «{pager.current_category}» не загрузилась: {error}",
                     )
                     pager.advance_category()
                 await asyncio.sleep(LOADS_STEP_DELAY_SECONDS)
@@ -256,18 +217,15 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
                 if target_count is not None and loader_state.added_count >= target_count:
                     break
 
-                # Дешёвая предварительная проверка по названию — не тратим
-                # скачивание и ffmpeg на то, что почти наверняка уже есть.
                 if mif_core.find_duplicate_by_title(sound["title"]) is not None:
                     await asyncio.sleep(LOADS_STEP_DELAY_SECONDS)
                     continue
 
+                sound["source_type"] = "myinstants"
                 try:
                     status, _ = await import_one_sound(bot, session, sound)
-                except Exception as error:  # не даём фоновой задаче умереть молча
-                    logger.exception(
-                        "Автозагрузка: непредвиденная ошибка на «%s»", sound["title"]
-                    )
+                except Exception as error:
+                    logger.exception("Автозагрузка: непредвиденная ошибка на «%s»", sound["title"])
                     await mif_core.report_bug(
                         bot,
                         f"Автозагрузка: непредвиденная ошибка на «{sound['title']}»: {error}",
@@ -294,8 +252,7 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
 async def handle_loads_start(message: Message, target_count: int | None) -> None:
     if loader_state.task is not None and not loader_state.task.done():
         await message.answer(
-            "⚠️Автозагрузка уже запущена. Останови её через /loadsStop, если нужно "
-            "начать заново."
+            "⚠️Автозагрузка уже запущена. Останови её через /loadsStop, если нужно начать заново."
         )
         return
 
@@ -312,9 +269,7 @@ async def handle_loads_start(message: Message, target_count: int | None) -> None
             "Остановить досрочно — /loadsStop."
         )
     else:
-        await message.answer(
-            "▶️Автозагрузка запущена (бесконечный цикл).\nОстановить — /loadsStop."
-        )
+        await message.answer("▶️Автозагрузка запущена (бесконечный цикл).\nОстановить — /loadsStop.")
 
 
 async def handle_loads_stop(message: Message) -> None:
@@ -333,44 +288,41 @@ async def handle_loads_search(message: Message, query: str) -> None:
     if not query:
         await message.answer('Укажи запрос: /loadsSearch "текст".')
         return
-            # Раньше почти всегда срабатывал медленный обход категорий (5-15 сек),
-    # теперь в норме отвечает JSON API за секунду-две — обход категорий
-    # остаётся редким финальным резервом, а не обычным путём. Отдельное
-    # "подожди, это долго" сообщение больше не нужно как правило; если
-    # запрос всё же провалится до медленного резерва, это будет видно по
-    # тому, что ответ просто придёт не сразу.
-    await message.answer("🔍Ищу на MyInstants...")
+
+    await message.answer("🔍Ищу в интернете (TikTok / MyInstants)...")
 
     session = requests.Session()
     session.headers.update(importer.MYINSTANTS_HEADERS)
 
+    candidates = []
+    source_type = "tiktok"
+
+    # 1. Поиск в TikTok
     try:
-        # FUZZY_MATCH_FLOOR, а не строгий FUZZY_MATCH_THRESHOLD: человек сам
-        # попросил найти именно это, так что лучше честно показать ближайшую
-        # находку, чем молчать при отсутствии идеального совпадения. Обход
-        # категорий внутри search_catalog всё равно всегда использует
-        # строгий порог независимо от этого — см. докстринг search_catalog.
-        candidates = await importer.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR)
-    except importer.CatalogBlockedError:
-        logger.exception("MyInstants заблокировал доступ при поиске: %s", query)
-        await message.answer(
-            "⚠️MyInstants ответил 403 (отказ в доступе) — это подтверждает "
-            "блокировку, а не случайную сетевую ошибку. Попробуй позже."
+        candidates = await import_tiktok.search_catalog(
+            session, query, min_score=mif_core.FUZZY_MATCH_FLOOR
         )
-        return
-    except requests.RequestException:
-        logger.exception("Ошибка поиска на MyInstants: %s", query)
-        await message.answer("⚠️Не удалось обратиться к MyInstants. Попробуй ещё раз позже.")
-        return
+    except Exception:
+        logger.exception("Ошибка поиска в TikTok для /loadsSearch: %s", query)
+
+    # 2. Фолбэк на MyInstants
+    if not candidates:
+        source_type = "myinstants"
+        try:
+            candidates = await importer.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR)
+        except getattr(importer, "CatalogBlockedError", Exception):
+            await message.answer("⚠️MyInstants ответил 403 (отказ в доступе). Попробуй позже.")
+            return
+        except requests.RequestException:
+            await message.answer("⚠️Не удалось обратиться к источникам поиска. Попробуй позже.")
+            return
 
     if not candidates:
-        await message.answer(
-            f"На MyInstants совсем ничего похожего на «{query}» не нашлось "
-            "(даже приблизительно) — просканированные категории пустые для этого запроса."
-        )
+        await message.answer(f"Ни в TikTok, ни на MyInstants ничего похожего на «{query}» не нашлось.")
         return
 
     best_score, sound = candidates[0]
+    sound["source_type"] = source_type
     is_confident_match = best_score >= mif_core.FUZZY_MATCH_THRESHOLD
 
     existing_by_title = mif_core.find_duplicate_by_title(sound["title"])
@@ -396,13 +348,13 @@ async def handle_loads_search(message: Message, query: str) -> None:
         return
 
     if status == "added" and entry is not None:
+        source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
         if is_confident_match:
-            await message.answer(f"✅Загрузил «{entry['title']}» и добавил в поиск.")
+            await message.answer(f"✅Загрузил с {source_label} «{entry['title']}» и добавил в поиск.")
         else:
             await message.answer(
-                f"Точного совпадения для «{query}» не нашёл, но вот ближайшее, что "
-                f"удалось найти: «{entry['title']}» (балл совпадения {best_score:.0f}/100). "
-                "Загрузил и добавил в поиск — если это не то, попробуй другой запрос."
+                f"Точного совпадения для «{query}» не нашёл, но вот ближайшее с {source_label}: "
+                f"«{entry['title']}» (балл {best_score:.0f}/100). Загрузил и добавил в поиск."
             )
         return
 
@@ -410,36 +362,7 @@ async def handle_loads_search(message: Message, query: str) -> None:
 
 
 async def background_internet_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
-    """Локальный инлайн-поиск дал слабое совпадение (см. main.py:search_mifs)
-    — пробуем найти похожий звук на MyInstants в фоне и, если получится,
-    публикуем его (через тот же import_one_sound/publish_voice_mif, что и
-    везде). Поиск и публикация всегда выполняются полностью — даже для
-    заглушённого (mute) пользователя: заглушка отключает только сообщения
-    ЕМУ, общая база по-прежнему пополняется для всех.
-
-    Статусы, которые видит человек (если не заглушил):
-    🔍 Ищу в интернете «запрос»...      — стартовало (локальный поиск ничего не дал)
-    ➖ Нашёл: «запрос» — публикую...    — нашли на сайте, качаем/конвертируем/публикуем
-    ✅ Готово                           — опубликовано (или уже было в базе)
-    ⚠️ Не нашёл: «запрос»               — не нашлось ни в базе, ни в интернете
-
-    Специально БЕЗ отправки самого голосового файла в личку — только
-    статус. Найти сам звук после "✅Готово" можно обычным инлайн-поиском.
-
-    ВАЖНО: результат не может попасть в тот же самый инлайн-ответ — как
-    только Telegram показал инлайн-подсказки, дополнить их позже нельзя,
-    статус обязательно приходит отдельными сообщениями в личку.
-
-    ВЫЗЫВАТЬ НЕ НАПРЯМУЮ, а через schedule_background_lookup — эта функция
-    сама не знает про debounce, ждёт вызова "прямо сейчас, точно финальный
-    запрос". Защита от спама на каждую букву во время печати живёт в
-    schedule_background_lookup, не здесь.
-
-    ТАКЖЕ ВАЖНО: сообщения дойдут, только если requester_id уже хотя бы раз
-    писал боту (/start) — Telegram не разрешает ботам первыми писать
-    пользователю. Если это не так, просто тихо логируем и не пишем дальше
-    (поиск и публикация всё равно продолжаются — базе это не мешает).
-    """
+    """Инлайн-поиск дал слабое совпадение — пробуем найти похожий звук в фоне (сначала TikTok, затем MyInstants)."""
     muted = mif_core.is_muted(requester_id)
     can_message = True
 
@@ -448,8 +371,7 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
             await bot.send_message(requester_id, f"🔍Ищу в интернете «{query_text}»...")
         except TelegramAPIError:
             logger.info(
-                "Не удалось написать пользователю %s (возможно, не начинал чат с ботом) — "
-                "поиск всё равно продолжится, просто без статусов ему",
+                "Не удалось написать пользователю %s — поиск продолжен без статусов",
                 requester_id,
             )
             can_message = False
@@ -461,39 +383,49 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     session = requests.Session()
     session.headers.update(importer.MYINSTANTS_HEADERS)
 
+    candidates = []
+    source_type = "tiktok"
+
+    # --- 1. Пробуем TikTok ---
     try:
-        # fast_only=True — только API, без HTML-поиска и обхода категорий:
-        # это часть, которая должна быть быстрой (см. докстринг выше).
-        # Явно строгий порог (не FUZZY_MATCH_FLOOR, как у /loadsSearch) —
-        # публикуется в общий канал автоматически, без человека, который мог
-        # бы сам решить "ну и ладно, похоже".
-        candidates = await importer.search_catalog(
+        candidates = await import_tiktok.search_catalog(
             session,
             query_text,
             max_results=1,
             min_score=mif_core.FUZZY_MATCH_THRESHOLD,
-            fast_only=True,
         )
     except Exception:
-        logger.exception("Быстрый фоновый поиск на MyInstants упал для запроса «%s»", query_text)
-        await notify(f"⚠️Не нашёл: «{query_text}»")
-        return
+        logger.exception("Быстрый фоновый поиск в TikTok упал для запроса «%s»", query_text)
+
+    # --- 2. Если TikTok пуст/упал — пробуем MyInstants ---
+    if not candidates:
+        source_type = "myinstants"
+        try:
+            candidates = await importer.search_catalog(
+                session,
+                query_text,
+                max_results=1,
+                min_score=mif_core.FUZZY_MATCH_THRESHOLD,
+                fast_only=True,
+            )
+        except Exception:
+            logger.exception("Быстрый фоновый поиск на MyInstants упал для запроса «%s»", query_text)
 
     if not candidates:
         await notify(f"⚠️Не нашёл: «{query_text}»")
         return
 
     _, sound = candidates[0]
+    sound["source_type"] = source_type
 
     existing = mif_core.find_duplicate_by_title(sound["title"])
     if existing is not None:
-        # Уже есть — качать/конвертировать нечего, сразу готово.
         await notify("✅Готово")
         return
 
-    await notify(f"➖Нашёл: «{query_text}» — публикую в базу...")
+    source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
+    await notify(f"➖Нашёл в {source_label}: «{query_text}» — публикую в базу...")
 
-    # Дальше — медленная часть: скачивание, конвертация, публикация.
     try:
         status, entry = await import_one_sound(bot, session, sound)
     except Exception:
@@ -512,8 +444,7 @@ async def _try_send_message(bot: Bot, chat_id: int, text: str) -> None:
 
 
 async def handle_loads_commands(message: Message) -> None:
-    """Точка входа для любого текста, начинающегося с /loads — main.py
-    регистрирует хендлер и просто вызывает эту функцию."""
+    """Точка входа для любого текста, начинающегося с /loads."""
     text = (message.text or "").strip()
 
     search_match = LOADS_SEARCH_RE.match(text)
@@ -545,3 +476,4 @@ async def handle_loads_commands(message: Message) -> None:
         "/loadsStop — остановить\n"
         '/loadsSearch "запрос" — найти и загрузить конкретный звук'
     )
+    
