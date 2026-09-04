@@ -70,6 +70,11 @@ async def start_private_chat(message: Message, state: FSMContext) -> None:
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 
+from aiogram.filters import Command
+from aiogram import F
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+
 @dp.message(Command("start"), F.chat.type == "private")
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -89,6 +94,7 @@ async def start_private_chat(message: Message, state: FSMContext) -> None:
     )
 
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    
     
     # Обязательно передаем parse_mode="HTML", чтобы сработали теги <b>
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
