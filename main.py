@@ -85,8 +85,6 @@ async def start_private_chat(message: Message, state: FSMContext) -> None:
     )
 
     
-    # Обязательно передаем parse_mode="HTML", чтобы сработали теги <b>
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
     
 @dp.message(Command("mute"), F.chat.type == "private")
 async def mute_command(message: Message) -> None:
