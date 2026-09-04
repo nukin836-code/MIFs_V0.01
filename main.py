@@ -59,10 +59,10 @@ async def cancel_addition(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("Добавление звука отменено.")
 
-
-@dp.message(Command("start"), F.chat.type == ("private")
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
      from aiogram.fsm.context import FSMContext
+
+@dp.message(Command("start"), F.chat.type == "private")
 
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
