@@ -67,8 +67,6 @@ from aiogram.fsm.context import FSMContext
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
     
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.context import FSMContext
 
 from aiogram.filters import Command
 from aiogram import F
@@ -78,19 +76,18 @@ from aiogram.fsm.context import FSMContext
 @dp.message(Command("start"), F.chat.type == "private")
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
-    
-    text = (
-        "Привет! Я <b>MIFs</b> — бот для поиска и сохранения голосовых мемов. 🔊\n\n"
-        "• Пиши @MIFki_bot в любом чате для быстрого поиска\n"
-        "• Добавь ⭐ в конец запроса, чтобы сохранить звук\n"
-        "• Кидай сюда аудио или голосовое, чтобы добавить свой звук\n\n"
-        "Управление: /mute | /cancel"
-    )
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📖 Полная помощь", callback_data="cmd_help")]
-        ]
+    await message.answer(
+        "<b>🔊 MIFs</b>\n\n"
+        "Поиск звуков:\n"
+        "<code>@MIFki_bot запрос</code>\n\n"
+        "⭐ Добавить звук в избранное:\n"
+        "<code>@MIFki_bot запрос⭐</code>\n\n"
+        "⭐ Избранное:\n"
+        "<code>/favorites</code>\n\n"
+        "Добавить свой звук — отправь сюда аудио или голосовое.\n\n"
+        "Подробнее: /help",
+        parse_mode="HTML",
     )
 
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
