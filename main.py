@@ -67,31 +67,40 @@ from aiogram.fsm.context import FSMContext
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
     
-
 from aiogram.filters import Command
 from aiogram import F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
 
-@dp.message(Command("start"), F.chat.type == "private")
+
+@dp.message(Command("start"))
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     await message.answer(
         "<b>🔊 MIFs</b>\n\n"
-        "Поиск звуков:\n"
-        "<code>@MIFki_bot запрос</code>\n\n"
-        "⭐ Добавить звук в избранное:\n"
-        "<code>@MIFki_bot запрос⭐</code>\n\n"
-        "⭐ Избранное:\n"
-        "<code>/favorites</code>\n\n"
-        "Добавить свой звук — отправь сюда аудио или голосовое.\n\n"
-        "Подробнее: /help",
+        "<b>Поиск</b>\n"
+        "@MIFki_bot запрос — найти звук\n"
+        "@MIFki_bot запрос⭐ — добавить в избранное\n\n"
+        "<b>Избранное</b>\n"
+        "/favorites — показать избранное\n"
+        "/favorite запрос — добавить звук\n"
+        "/unfavorite запрос — удалить звук\n\n"
+        "<b>Другое</b>\n"
+        "/cancel — отменить добавление\n"
+        "/mute — отключить уведомления\n"
+        "/unmute — включить уведомления\n"
+        "/help — помощь",
+        parse_mode="HTML",
+    )
+@dp.callback_query(F.data == "show_help")
+async def show_help_button(callback) -> None:
+    await callback.answer()
+    await callback.message.answer(
+        HELP_TEXT,
         parse_mode="HTML",
     )
 
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-    
     
     # Обязательно передаем parse_mode="HTML", чтобы сработали теги <b>
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
