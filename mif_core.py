@@ -49,11 +49,6 @@ VOICE_OPUS_BITRATE = "32k"
 HASH_WAV_SAMPLE_RATE = "16000"
 HASH_WAV_CHANNELS = "1"
 
-# ПРИМЕЧАНИЕ: минимальный аналог функции баг-репортов — у тебя, по твоим
-# словам, была своя, я её не получил. Если найдёшь/пришлёшь — просто замени
-# тело report_bug() ниже на вызов твоей, остальной код от этого не зависит.
-BUG_REPORT_CHAT_ID = os.getenv("BUG_REPORT_CHAT_ID", "-5476127508")
-
 # Сколько раз повторить запрос к Telegram, если он ответил flood control
 # (429 Too Many Requests), прежде чем сдаться и поднять исключение выше.
 MAX_RATE_LIMIT_RETRIES = 3
@@ -460,7 +455,6 @@ def compute_content_hash(wav_path: Path) -> str:
             hasher.update(chunk)
     return hasher.hexdigest()
 
-
 # recognize_google не умеет сам определять язык — приходится указывать
 # явно. Раньше был жёстко зашит только ru-RU, из-за чего распознавание
 # ломалось на любой английской речи (а её теперь много — контент с
@@ -617,7 +611,7 @@ async def _call_with_flood_retry(action: Callable[[], Awaitable[_T]]) -> _T:
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
-# Несколько источников (фоновая /loads, автопоиск от разных пользователей
+# Несколько источников  (фоновая /loads, автопоиск от разных пользователей
 # одновременно, /loadsSearch) могут одновременно наткнуться на один и тот
 # же звук. Раньше проверка "такого ещё нет" и сама публикация были
 # раздельными шагами — оба успевали пройти проверку раньше, чем любой из
@@ -729,11 +723,3 @@ async def publish_voice_mif(
         MIFS_DATABASE.append(new_mif)
         save_mifs()
         return "added", new_mif
-
-
-async def report_bug(bot: Bot, text: str) -> None:
-    """Шлёт короткое сообщение об ошибке в группу для баг-репортов."""
-    try:
-        await bot.send_message(chat_id=int(BUG_REPORT_CHAT_ID), text=clip_text(text, 3500))
-    except (TelegramAPIError, ValueError):
-        logger.exception("Не удалось отправить баг-репорт в группу")
