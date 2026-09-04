@@ -35,7 +35,6 @@ logger = logging.getLogger("mif-bot.core")
 DATABASE_PATH = Path(__file__).with_name("mifs_database.json")
 MUTED_USERS_PATH = Path(__file__).with_name("muted_users.json")
 LEGACY_DATABASE_PATH = Path(__file__).with_name("mifs.json")
-FAVORITES_PATH = Path(__file__).with_name("favorites.json")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@MIFFFKI")
 MAX_CAPTION_TEXT_LENGTH = 300
 TRANSCRIPTION_TIMEOUT_SECONDS = 20
@@ -151,124 +150,6 @@ def save_mifs() -> None:
     temporary_path.replace(DATABASE_PATH)
 
 
-def load_favorites() -> dict[str, list[str]]:
-    """Загружает связи user_id -> список sound_id."""
-    if not FAVORITES_PATH.exists():
-        return {}
-
-    try:
-        data = json.loads(FAVORITES_PATH.read_text(encoding="utf-8"))
-    except (OSError, JSONDecodeError):
-        logger.exception("Не удалось прочитать базу избранного")
-        return {}
-
-    if not isinstance(data, dict):
-        logger.warning("База избранного имеет неправильный формат")
-        return {}
-
-    result: dict[str, list[str]] = {}
-
-    for user_id, sound_ids in data.items():
-        if not isinstance(sound_ids, list):
-            continue
-
-        result[str(user_id)] = [str(sound_id) for sound_id in sound_ids]
-
-    return result
-
-
-def save_favorites() -> None:
-    temporary_path = FAVORITES_PATH.with_suffix(".tmp")
-    temporary_path.write_text(
-        json.dumps(FAVORITES_DATABASE, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary_path.replace(FAVORITES_PATH)
-
-
-FAVORITES_DATABASE: dict[str, list[str]] = load_favorites()
-
-
-def add_favorite(user_id: int, sound_id: str) -> bool:
-    """Добавляет звук пользователю в избранное."""
-    user_key = str(user_id)
-    sound_id = str(sound_id)
-
-    user_favorites = FAVORITES_DATABASE.setdefault(user_key, [])
-
-    if sound_id in user_favorites:
-        return False
-
-    user_favorites.append(sound_id)
-    save_favorites()
-    return True
-
-
-def remove_favorite(user_id: int, sound_id: str) -> bool:
-    """Удаляет звук пользователя из избранного."""
-    user_key = str(user_id)
-    sound_id = str(sound_id)
-
-    user_favorites = FAVORITES_DATABASE.get(user_key, [])
-
-    if sound_id not in user_favorites:
-        return False
-
-    user_favorites.remove(sound_id)
-
-    if user_favorites:
-        FAVORITES_DATABASE[user_key] = user_favorites
-    else:
-        FAVORITES_DATABASE.pop(user_key, None)
-
-    save_favorites()
-    return True
-
-
-def is_favorite(user_id: int, sound_id: str) -> bool:
-    return str(sound_id) in FAVORITES_DATABASE.get(str(user_id), [])
-
-
-def get_favorite_mifs(
-    user_id: int,
-    limit: int | None = 10,
-) -> list[dict[str, Any]]:
-    """Возвращает избранные звуки пользователя."""
-    favorite_ids = FAVORITES_DATABASE.get(str(user_id), [])
-    result: list[dict[str, Any]] = []
-
-    for sound_id in reversed(favorite_ids):
-        for mif in MIFS_DATABASE:
-            if str(mif.get("id", "")) == sound_id:
-                result.append(mif)
-                break
-
-        if limit is not None and len(result) >= limit:
-            break
-
-    return result
-
-
-def get_recent_mifs(limit: int = 20) -> list[dict[str, Any]]:
-    """Возвращает последние добавленные звуки."""
-    if limit <= 0:
-        return []
-
-    return list(reversed(MIFS_DATABASE[-limit:]))
-
-
-def find_mif_by_id(sound_id: str) -> dict[str, Any] | None:
-    """Ищет звук по ID."""
-    sound_id = str(sound_id)
-
-    for mif in MIFS_DATABASE:
-        if str(mif.get("id", "")) == sound_id:
-            return mif
-
-    return None
-    
-
-
 def next_mif_id() -> str:
     numeric_ids = []
     for mif in MIFS_DATABASE:
@@ -277,6 +158,7 @@ def next_mif_id() -> str:
         except (KeyError, TypeError, ValueError):
             continue
     return str(max(numeric_ids, default=0) + 1)
+
 
 def clip_text(value: str, max_length: int = MAX_CAPTION_TEXT_LENGTH) -> str:
     if len(value) <= max_length:
