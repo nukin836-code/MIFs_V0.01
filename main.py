@@ -61,26 +61,34 @@ async def cancel_addition(message: Message, state: FSMContext) -> None:
 
 
 @dp.message(Command("start"), F.chat.type == "private")
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
-        "Привет! Я бот для поиска и загрузки голосовых мем-звуков (MIF).\n\n"
-        "Что я умею:\n"
-        "🔍 Умный поиск: Пиши в любом чате через инлайн-режим (@MIFki_bot) "
-        "— мгновенно поищу звук в базе, а если его нет — автоматически "
-        "сбегаю на MyInstants и добавлю. О статусе напишу в личку.\n"
-        "⭐ Избранное: добавь найденный звук в избранное, поставив ⭐ "
-        "в конце запроса.\n"
-        "➕ Добавление своих звуков:\n"
-        "1. Отправь мне аудиофайл или голосовое.\n"
-        "2. Напиши название и теги следующим сообщением.\n"
-        "Звук сразу улетит в канал и станет доступен всем.\n\n"
-        "Не хочешь получать уведомления об автопоиске — /mute "
-        "(обратно — /unmute).\n"
-        "Для отмены загрузки в любой момент — /cancel."
+    
+    # Текст разбит на визуальные блоки с жирными заголовками для читаемости
+    text = (
+        "Привет! Я <b>MIFs</b> — твой архив голосовых мем-звуков. 🔊\n\n"
+        "<b>Что я умею:</b>\n"
+        "🔍 <b>Искать везде:</b> Пиши @MIFki_bot в любом чате. Если звука нет в базе, я сам скачаю его с MyInstants.\n"
+        "⭐ <b>Сохранять лучшее:</b> Допиши ⭐ в конец запроса, чтобы добавить найденный звук в избранное.\n"
+        "➕ <b>Загружать твоё:</b> Отправь мне аудио или голосовое, а затем напиши название — звук станет доступен всем.\n\n"
+        "<b>Управление:</b>\n"
+        "/mute — отключить уведомления автопоиска (обратно — /unmute)\n"
+        "/cancel — отменить текущую загрузку"
     )
 
+    # Кнопка помощи под сообщением
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📖 Открыть помощь", callback_data="cmd_help")]
+        ]
+    )
 
+    # Обязательно передаем parse_mode="HTML", чтобы сработали теги <b>
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    
 @dp.message(Command("mute"), F.chat.type == "private")
 async def mute_command(message: Message) -> None:
     if message.from_user is None:
@@ -111,22 +119,46 @@ async def unmute_command(message: Message) -> None:
 # команды, доступные обычным людям. Админские (/loads, /loadsN, /loadsStop)
 # сюда НЕ добавлять.
 
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# Текст без тегов <code> вокруг команд, чтобы они подсвечивались синим
 HELP_TEXT = (
     "<b>🔊 MIFs</b>\n\n"
     "<b>Поиск</b>\n"
-    "<code>@MIFki_bot запрос</code> — найти звук\n"
-    "<code>@MIFki_bot запрос⭐</code> — добавить найденный звук в избранное\n"
-    "<code>@MIFki_bot</code> — показать избранное и последние звуки\n\n"
+    "@MIFki_bot запрос — найти звук\n"
+    "@MIFki_bot запрос⭐ — добавить найденный звук в избранное\n"
+    "@MIFki_bot — показать избранное и последние звуки\n\n"
     "<b>Избранное</b>\n"
-    "<code>/favorites</code> — показать избранное\n"
-    "<code>/favorite запрос</code> — добавить звук\n"
-    "<code>/unfavorite запрос</code> — удалить звук\n\n"
+    "/favorites — показать избранное\n"
+    "/favorite запрос — добавить звук\n"
+    "/unfavorite запрос — удалить звук\n\n"
     "<b>Другое</b>\n"
-    "<code>/cancel</code> — отменить добавление звука\n"
-    "<code>/mute</code> — отключить уведомления\n"
-    "<code>/unmute</code> — включить уведомления\n"
-    "<code>/help</code> — показать помощь"
+    "/cancel — отменить добавление звука\n"
+    "/mute — отключить уведомления\n"
+    "/unmute — включить уведомления\n"
+    "/help — показать помощь"
 )
+
+# Клавиатура с кнопками под сообщением
+help_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        # Инлайн-кнопки (сразу вставляют текст в строку ввода)
+        [
+            InlineKeyboardButton(text="🔍 Поиск звука", switch_inline_query_current_chat=""),
+            InlineKeyboardButton(text="⭐ Искать в избранном", switch_inline_query_current_chat="⭐")
+        ],
+        # Кнопки-колбеки (работают как команды)
+        [
+            InlineKeyboardButton(text="📁 Моё избранное", callback_data="cmd_favorites"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cmd_cancel")
+        ],
+        [
+            InlineKeyboardButton(text="🔕 Mute", callback_data="cmd_mute"),
+            InlineKeyboardButton(text="🔔 Unmute", callback_data="cmd_unmute")
+        ]
+    ]
+)
+
 
 
 @dp.message(Command("help"), F.chat.type == "private")
