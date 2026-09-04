@@ -56,7 +56,7 @@ class LoaderState:
 
 loader_state = LoaderState()
 
-DEBOUNCE_DELAY_SECONDS = 0.5
+DEBOUNCE_DELAY_SECONDS = 0.7
 
 
 class _UserLookupState:

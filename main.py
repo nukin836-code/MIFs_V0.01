@@ -40,8 +40,7 @@ MAX_DESCRIPTION_LENGTH = 700
 
 # Ограничения inline-выдачи по умолчанию.
 MAX_FAVORITES_RESULTS = 10
-MAX_RECENT_RESULTS = 10
-MAX_DEFAULT_RESULTS = MAX_FAVORITES_RESULTS + MAX_RECENT_RESULTS
+MAX_DEFAULT_RESULTS = 20
 
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -111,41 +110,235 @@ async def unmute_command(message: Message) -> None:
 # меняешь поведение существующей — обнови текст ниже. Сюда идут ТОЛЬКО
 # команды, доступные обычным людям. Админские (/loads, /loadsN, /loadsStop)
 # сюда НЕ добавлять.
-HELP_TEXT = (
-    "🔊 <b>MIFs — звуковые мемы</b>\n\n"
-    "<b>Найти звук:</b>\n"
-    "В любом чате набери <code>@MIFki_bot запрос</code> — появится список "
-    "подходящих звуков. Можно вводить несколько слов в любом порядке "
-    "(например: «котик мем»).\n"
-    "Если в базе ничего не нашлось, бот сам поищет на MyInstants. Статус "
-    "придёт в личку: 🔍 ищу → ➖ нашёл, публикую → ✅ готово (или ⚠️ не "
-    "нашёл). Сам файл в личку не присылается — как будет готово, найдёшь "
-    "его тем же инлайн-поиском.\n\n"
-    "<b>Избранное:</b>\n"
-    "Чтобы добавить найденный звук в избранное, поставь ⭐ в конце запроса. "
-    "Например: <code>@MIFki_bot мяу⭐</code>.\n"
-    "Пустой запрос <code>@MIFki_bot</code> показывает до 10 твоих "
-    "избранных звуков и до 10 последних глобальных звуков.\n\n"
-    "<b>Добавить свой звук:</b>\n"
-    "1. Пришли мне аудиофайл или голосовое сообщение.\n"
-    "2. Следующим сообщением напиши название и теги.\n"
-    "Звук опубликуется в @MIFFFKI и станет доступен в поиске.\n"
-    "Отменить незавершённое добавление — /cancel.\n\n"
-    "<b>Загрузить конкретный звук с MyInstants:</b>\n"
-    '<code>/loadsSearch "запрос"</code> — найду и загружу звук по названию. '
-    "Если он уже есть в базе — пришлю уже существующую версию, а не буду "
-    "публиковать заново.\n\n"
-    "<b>Уведомления:</b>\n"
-    "/mute — отключить сообщения об автопоиске в личке.\n"
-    "/unmute — включить обратно.\n\n"
-    "/help — показать это сообщение ещё раз."
-)
 
+HELP_TEXT = (
+    "<b>🔊 MIFs</b>\n\n"
+    "<b>Поиск</b>\n"
+    "<code>@MIFki_bot запрос</code> — найти звук\n"
+    "<code>@MIFki_bot запрос⭐</code> — добавить найденный звук в избранное\n"
+    "<code>@MIFki_bot</code> — показать избранное и последние звуки\n\n"
+    "<b>Избранное</b>\n"
+    "<code>/favorites</code> — показать избранное\n"
+    "<code>/favorite запрос</code> — добавить звук\n"
+    "<code>/unfavorite запрос</code> — удалить звук\n\n"
+    "<b>Другое</b>\n"
+    "<code>/cancel</code> — отменить добавление звука\n"
+    "<code>/mute</code> — отключить уведомления\n"
+    "<code>/unmute</code> — включить уведомления\n"
+    "<code>/help</code> — показать помощь"
+)
 
 @dp.message(Command("help"), F.chat.type == "private")
 async def show_help(message: Message) -> None:
     await message.answer(HELP_TEXT, parse_mode="HTML")
 
+def _get_command_argument(message: Message) -> str:
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) < 2:
+        return ""
+
+    return parts[1].strip()
+
+
+def _find_mif_by_query(query_text: str) -> dict | None:
+    """Ищет звук по ID или обычным поиском."""
+    query_text = query_text.strip()
+
+    if not query_text:
+        return None
+
+    # Если передали числовой ID — ищем напрямую.
+    if query_text.isdigit():
+        mif = mif_core.find_mif_by_id(query_text)
+        if mif is not None:
+            return mif
+
+    matches, best_score = mif_core.find_matching_mifs(query_text)
+
+    if not matches:
+        return None
+
+    if best_score < mif_core.FUZZY_MATCH_THRESHOLD:
+        return None
+
+    return matches[0]
+
+
+@dp.message(Command("favorites"), F.chat.type == "private")
+async def favorites_command(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    favorites = mif_core.get_favorite_mifs(
+        message.from_user.id,
+        limit=None,
+    )
+
+    if not favorites:
+        await message.answer(
+            "⭐ Избранное пусто."
+        )
+        return
+
+    lines = ["<b>⭐ Твоё избранное:</b>", ""]
+
+    for index, mif in enumerate(favorites, start=1):
+        title = str(
+            mif.get(
+                "title",
+                mif.get("user_description", "Звук"),
+            )
+        )
+
+        lines.append(
+            f"{index}. ⭐ {html.escape(title[:100])}"
+        )
+
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("favorite"), F.chat.type == "private")
+async def favorite_command(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    query_text = _get_command_argument(message)
+
+    if not query_text:
+        await message.answer(
+            "Использование:\n"
+            "<code>/favorite название звука</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    mif = _find_mif_by_query(query_text)
+
+    if mif is None:
+        await message.answer(
+            "❌ Не нашёл такой звук в базе."
+        )
+        return
+
+    sound_id = str(mif.get("id", ""))
+
+    if not sound_id:
+        await message.answer(
+            "❌ У этого звука нет ID."
+        )
+        return
+
+    if mif_core.is_favorite(message.from_user.id, sound_id):
+        title = str(
+            mif.get(
+                "title",
+                mif.get("user_description", "Звук"),
+            )
+        )
+        await message.answer(
+            f"⭐ Уже в избранном: «{html.escape(title)}»",
+            parse_mode="HTML",
+        )
+        return
+
+    mif_core.add_favorite(
+        message.from_user.id,
+        sound_id,
+    )
+
+    title = str(
+        mif.get(
+            "title",
+            mif.get("user_description", "Звук"),
+        )
+    )
+
+    await message.answer(
+        f"⭐ Добавлено в избранное: «{html.escape(title)}»",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("unfavorite"), F.chat.type == "private")
+async def unfavorite_command(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    query_text = _get_command_argument(message)
+
+    if not query_text:
+        await message.answer(
+            "Использование:\n"
+            "<code>/unfavorite название звука</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Сначала пробуем найти точный ID.
+    mif = None
+
+    if query_text.isdigit():
+        candidate = mif_core.find_mif_by_id(query_text)
+        if candidate is not None and mif_core.is_favorite(
+            message.from_user.id,
+            str(candidate.get("id", "")),
+        ):
+            mif = candidate
+
+    # Если по ID не нашли — ищем по названию/тегам.
+    if mif is None:
+        favorites = mif_core.get_favorite_mifs(
+            message.from_user.id,
+            limit=None,
+        )
+
+        favorite_ids = {
+            str(item.get("id", ""))
+            for item in favorites
+        }
+
+        matches, best_score = mif_core.find_matching_mifs(query_text)
+
+        if best_score >= mif_core.FUZZY_MATCH_THRESHOLD:
+            for candidate in matches:
+                candidate_id = str(candidate.get("id", ""))
+
+                if candidate_id in favorite_ids:
+                    mif = candidate
+                    break
+
+    if mif is None:
+        await message.answer(
+            "❌ Такой звук не найден в твоём избранном."
+        )
+        return
+
+    sound_id = str(mif.get("id", ""))
+
+    if not mif_core.remove_favorite(
+        message.from_user.id,
+        sound_id,
+    ):
+        await message.answer(
+            "❌ Не удалось удалить звук из избранного."
+        )
+        return
+
+    title = str(
+        mif.get(
+            "title",
+            mif.get("user_description", "Звук"),
+        )
+    )
+
+    await message.answer(
+        f"✅ Удалено из избранного: «{html.escape(title)}»",
+        parse_mode="HTML",
+    )
 
 @dp.message(F.chat.type == "private", F.text.startswith("/loads"))
 async def loads_commands(message: Message) -> None:
@@ -326,13 +519,14 @@ async def handle_unknown_command(message: Message) -> None:
 
 def _build_inline_result(mif: dict, favorite: bool = False):
     """
-    Преобразует запись MIF из базы в Telegram inline result.
+    Преобразует запись MIF в Telegram inline result.
 
-    favorite=True меняет только отображаемое название.
-    Данные самого MIF в базе не изменяются.
+    favorite=True добавляет ⭐ только к отображаемому названию.
+    База MIF при этом не изменяется.
     """
     mif_id = str(mif.get("id", ""))
     file_id = str(mif.get("file_id", ""))
+
     file_type = mif.get(
         "file_type",
         mif.get("media_type", "voice"),
@@ -348,33 +542,31 @@ def _build_inline_result(mif: dict, favorite: bool = False):
     if favorite:
         title = f"⭐ {title}"
 
+    title = title[:64] or "Звук"
+
     if file_type == "audio":
         return InlineQueryResultCachedAudio(
             id=mif_id,
             audio_file_id=file_id,
+            title=title,
         )
 
     return InlineQueryResultCachedVoice(
         id=mif_id,
         voice_file_id=file_id,
-        title=title[:64] or "Голосовое сообщение",
+        title=title,
     )
-
 
 def _merge_default_results(
     favorites: list[dict],
     recent: list[dict],
 ) -> list[tuple[dict, bool]]:
     """
-    Формирует стандартную выдачу:
+    До 10 избранных, затем заполняем оставшиеся места последними
+    глобальными звуками.
 
-    1. максимум 10 избранных;
-    2. максимум 10 последних глобальных;
-    3. дубликаты между блоками удаляются;
-    4. общий максимум — 20 результатов.
-
-    Возвращаем (mif, is_favorite), чтобы ⭐ отображалась только
-    у избранных результатов.
+    Общий максимум — 20.
+    Дубликаты удаляются.
     """
     results: list[tuple[dict, bool]] = []
     already_added: set[str] = set()
@@ -388,10 +580,8 @@ def _merge_default_results(
         already_added.add(mif_id)
         results.append((mif, True))
 
-    recent_added = 0
-
     for mif in recent:
-        if recent_added >= MAX_RECENT_RESULTS:
+        if len(results) >= MAX_DEFAULT_RESULTS:
             break
 
         mif_id = str(mif.get("id", ""))
@@ -401,10 +591,8 @@ def _merge_default_results(
 
         already_added.add(mif_id)
         results.append((mif, False))
-        recent_added += 1
 
     return results[:MAX_DEFAULT_RESULTS]
-
 
 @dp.inline_query()
 async def search_mifs(query: InlineQuery) -> None:
@@ -486,27 +674,126 @@ async def search_mifs(query: InlineQuery) -> None:
     matches, best_score = mif_core.find_matching_mifs(search_text)
 
     # Если это запрос с ⭐ — сохраняем лучший найденный звук.
-    if add_to_favorites and matches:
+@dp.inline_query()
+async def search_mifs(query: InlineQuery) -> None:
+    """
+    Inline-поиск.
+
+    @MIFki_bot мяу
+        обычный поиск
+
+    @MIFki_bot мяу⭐
+        поиск + добавление найденного звука в избранное
+
+    @MIFki_bot
+        избранное + последние звуки
+    """
+    user_id = query.from_user.id
+    raw_query = query.query.strip()
+
+    add_to_favorites = raw_query.endswith("⭐")
+
+    if add_to_favorites:
+        search_text = raw_query[:-1].strip()
+    else:
+        search_text = raw_query
+
+    # Пустой запрос.
+    if not search_text:
+        try:
+            favorites = mif_core.get_favorite_mifs(
+                user_id,
+                limit=MAX_FAVORITES_RESULTS,
+            )
+
+            recent = mif_core.get_recent_mifs(
+                limit=MAX_DEFAULT_RESULTS + MAX_FAVORITES_RESULTS,
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось получить избранные/последние MIF "
+                "для user_id=%s",
+                user_id,
+            )
+
+            favorites = []
+            recent = []
+
+        merged_results = _merge_default_results(
+            favorites,
+            recent,
+        )
+
+        results = [
+            _build_inline_result(
+                mif,
+                favorite=is_favorite,
+            )
+            for mif, is_favorite in merged_results
+        ]
+
+        await query.answer(
+            results=results,
+            cache_time=1,
+            is_personal=True,
+        )
+        return
+
+    # Обычный поиск.
+    matches, best_score = mif_core.find_matching_mifs(search_text)
+
+    # ⭐ добавляет только действительно найденный звук.
+    if (
+        add_to_favorites
+        and matches
+        and best_score >= mif_core.FUZZY_MATCH_THRESHOLD
+    ):
         favorite_mif = matches[0]
         favorite_id = favorite_mif.get("id")
 
         if favorite_id is not None:
             try:
                 mif_core.add_favorite(
-                    query.from_user.id,
-                    int(favorite_id),
+                    user_id,
+                    str(favorite_id),
                 )
             except Exception:
                 logger.exception(
-                    "Не удалось добавить MIF id=%s в избранное пользователя %s",
+                    "Не удалось добавить MIF id=%s "
+                    "в избранное пользователя %s",
                     favorite_id,
-                    query.from_user.id,
+                    user_id,
                 )
 
-    results = [
-        _build_inline_result(mif)
-        for mif in matches
-    ]
+    # Для каждого результата отдельно проверяем избранное именно этого
+    # пользователя.
+    results = []
+
+    for mif in matches:
+        mif_id = str(mif.get("id", ""))
+
+        favorite = False
+
+        if mif_id:
+            try:
+                favorite = mif_core.is_favorite(
+                    user_id,
+                    mif_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось проверить избранное "
+                    "MIF id=%s пользователя %s",
+                    mif_id,
+                    user_id,
+                )
+
+        results.append(
+            _build_inline_result(
+                mif,
+                favorite=favorite,
+            )
+        )
 
     await query.answer(
         results=results,
@@ -514,15 +801,12 @@ async def search_mifs(query: InlineQuery) -> None:
         is_personal=True,
     )
 
-    # ⭐ не должен мешать обычному fallback-поиску:
-    # MyInstants ищется по очищенному запросу, без ⭐.
     if search_text and best_score < mif_core.FUZZY_MATCH_THRESHOLD:
         mif_loader.schedule_background_lookup(
             query.bot,
-            query.from_user.id,
+            user_id,
             search_text,
         )
-
 
 async def main() -> None:
     bot_token = os.getenv("BOT_TOKEN")

@@ -190,7 +190,7 @@ FAVORITES_DATABASE: dict[str, list[str]] = load_favorites()
 
 
 def add_favorite(user_id: int, sound_id: str) -> bool:
-    """Добавляет звук в избранное."""
+    """Добавляет звук пользователю в избранное."""
     user_key = str(user_id)
     sound_id = str(sound_id)
 
@@ -205,7 +205,7 @@ def add_favorite(user_id: int, sound_id: str) -> bool:
 
 
 def remove_favorite(user_id: int, sound_id: str) -> bool:
-    """Удаляет звук из избранного."""
+    """Удаляет звук пользователя из избранного."""
     user_key = str(user_id)
     sound_id = str(sound_id)
 
@@ -231,11 +231,10 @@ def is_favorite(user_id: int, sound_id: str) -> bool:
 
 def get_favorite_mifs(
     user_id: int,
-    limit: int = 10,
+    limit: int | None = 10,
 ) -> list[dict[str, Any]]:
     """Возвращает избранные звуки пользователя."""
     favorite_ids = FAVORITES_DATABASE.get(str(user_id), [])
-
     result: list[dict[str, Any]] = []
 
     for sound_id in reversed(favorite_ids):
@@ -244,7 +243,7 @@ def get_favorite_mifs(
                 result.append(mif)
                 break
 
-        if len(result) >= limit:
+        if limit is not None and len(result) >= limit:
             break
 
     return result
@@ -259,7 +258,7 @@ def get_recent_mifs(limit: int = 20) -> list[dict[str, Any]]:
 
 
 def find_mif_by_id(sound_id: str) -> dict[str, Any] | None:
-    """Ищет звук по ID в основной базе."""
+    """Ищет звук по ID."""
     sound_id = str(sound_id)
 
     for mif in MIFS_DATABASE:
@@ -267,6 +266,7 @@ def find_mif_by_id(sound_id: str) -> dict[str, Any] | None:
             return mif
 
     return None
+    
 
 
 def next_mif_id() -> str:
