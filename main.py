@@ -60,53 +60,27 @@ async def cancel_addition(message: Message, state: FSMContext) -> None:
     await message.answer("Добавление звука отменено.")
 
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.context import FSMContext
 
-@dp.message(Command("start"), F.chat.type == "private")
-
-async def start_private_chat(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    
-from aiogram.filters import Command
-from aiogram import F
-from aiogram.types import Message
-from aiogram.fsm.context import FSMContext
-from aiogram import F
-from aiogram.types import CallbackQuery
 
 @dp.message(Command("start"), F.chat.type == "private")
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📖 Помощь",
-                    callback_data="cmd_help",
-                )
-            ]
-        ]
-    )
 
     await message.answer(
         "<b>🔊 MIFs</b>\n\n"
-        "Поиск звука:\n"
-        "@MIFki_bot запрос\n\n"
-        "Добавить в избранное:\n"
-        "@MIFki_bot запрос⭐\n\n"
-        "Избранное:\n"
-        "/favorites\n\n"
-        "Добавить свой звук — отправь сюда аудио или голосовое.\n\n"
-        "Команды: /favorites /favorite /unfavorite /cancel /mute /unmute",
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
-@dp.callback_query(F.data == "show_help")
-async def show_help_button(callback) -> None:
-    await callback.answer()
-    await callback.message.answer(
-        HELP_TEXT,
+        "<b>Поиск</b>\n"
+        "@MIFki_bot запрос — найти звук\n"
+        "@MIFki_bot запрос⭐ — добавить найденный звук в избранное\n"
+        "@MIFki_bot — показать избранное и последние звуки\n\n"
+        "<b>Избранное</b>\n"
+        "/favorites — показать избранное\n"
+        "/favorite запрос — добавить звук\n"
+        "/unfavorite запрос — удалить звук\n\n"
+        "<b>Другое</b>\n"
+        "/cancel — отменить добавление звука\n"
+        "/mute — отключить уведомления\n"
+        "/unmute — включить уведомления\n"
+        "/help — показать помощь",
         parse_mode="HTML",
     )
 
