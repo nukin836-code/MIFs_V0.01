@@ -38,7 +38,7 @@ logger = logging.getLogger("mif-bot")
 
 MAX_DESCRIPTION_LENGTH = 700
 
-# Ограничения inline-выдачи по умолчанию.
+# Ограничения inline-выдачи по умолчанию ага.
 MAX_FAVORITES_RESULTS = 10
 MAX_DEFAULT_RESULTS = 20
 
