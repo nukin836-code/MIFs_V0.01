@@ -149,7 +149,9 @@ def save_mifs() -> None:
         encoding="utf-8",
     )
     temporary_path.replace(DATABASE_PATH)
-    def load_favorites() -> dict[str, list[str]]:
+
+
+def load_favorites() -> dict[str, list[str]]:
     """Загружает связи user_id -> список sound_id."""
     if not FAVORITES_PATH.exists():
         return {}
@@ -188,11 +190,7 @@ FAVORITES_DATABASE: dict[str, list[str]] = load_favorites()
 
 
 def add_favorite(user_id: int, sound_id: str) -> bool:
-    """Добавляет звук в избранное.
-
-    Возвращает True, если связь была добавлена.
-    False — если этот звук уже был в избранном.
-    """
+    """Добавляет звук в избранное."""
     user_key = str(user_id)
     sound_id = str(sound_id)
 
@@ -207,10 +205,7 @@ def add_favorite(user_id: int, sound_id: str) -> bool:
 
 
 def remove_favorite(user_id: int, sound_id: str) -> bool:
-    """Удаляет звук из избранного.
-
-    Возвращает True, если связь существовала и была удалена.
-    """
+    """Удаляет звук из избранного."""
     user_key = str(user_id)
     sound_id = str(sound_id)
 
@@ -234,17 +229,15 @@ def is_favorite(user_id: int, sound_id: str) -> bool:
     return str(sound_id) in FAVORITES_DATABASE.get(str(user_id), [])
 
 
-def get_favorite_mifs(user_id: int, limit: int = 10) -> list[dict[str, Any]]:
-    """Возвращает избранные звуки пользователя.
-
-    Если звук уже удалён из основной базы — такая битая связь
-    автоматически игнорируется.
-    """
+def get_favorite_mifs(
+    user_id: int,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Возвращает избранные звуки пользователя."""
     favorite_ids = FAVORITES_DATABASE.get(str(user_id), [])
 
     result: list[dict[str, Any]] = []
 
-    # Идём в обратном порядке: последние добавленные в избранное сначала.
     for sound_id in reversed(favorite_ids):
         for mif in MIFS_DATABASE:
             if str(mif.get("id", "")) == sound_id:
@@ -259,10 +252,14 @@ def get_favorite_mifs(user_id: int, limit: int = 10) -> list[dict[str, Any]]:
 
 def get_recent_mifs(limit: int = 20) -> list[dict[str, Any]]:
     """Возвращает последние добавленные звуки."""
+    if limit <= 0:
+        return []
+
     return list(reversed(MIFS_DATABASE[-limit:]))
 
 
 def find_mif_by_id(sound_id: str) -> dict[str, Any] | None:
+    """Ищет звук по ID в основной базе."""
     sound_id = str(sound_id)
 
     for mif in MIFS_DATABASE:
@@ -280,7 +277,6 @@ def next_mif_id() -> str:
         except (KeyError, TypeError, ValueError):
             continue
     return str(max(numeric_ids, default=0) + 1)
-
 
 def clip_text(value: str, max_length: int = MAX_CAPTION_TEXT_LENGTH) -> str:
     if len(value) <= max_length:
