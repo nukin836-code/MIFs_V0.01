@@ -128,6 +128,7 @@ HELP_TEXT = (
     "<code>/help</code> — показать помощь"
 )
 
+
 @dp.message(Command("help"), F.chat.type == "private")
 async def show_help(message: Message) -> None:
     await message.answer(HELP_TEXT, parse_mode="HTML")
