@@ -71,27 +71,36 @@ from aiogram.filters import Command
 from aiogram import F
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
+from aiogram import F
+from aiogram.types import CallbackQuery
 
-
-@dp.message(Command("start"))
+@dp.message(Command("start"), F.chat.type == "private")
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
 
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📖 Помощь",
+                    callback_data="cmd_help",
+                )
+            ]
+        ]
+    )
+
     await message.answer(
         "<b>🔊 MIFs</b>\n\n"
-        "<b>Поиск</b>\n"
-        "@MIFki_bot запрос — найти звук\n"
-        "@MIFki_bot запрос⭐ — добавить в избранное\n\n"
-        "<b>Избранное</b>\n"
-        "/favorites — показать избранное\n"
-        "/favorite запрос — добавить звук\n"
-        "/unfavorite запрос — удалить звук\n\n"
-        "<b>Другое</b>\n"
-        "/cancel — отменить добавление\n"
-        "/mute — отключить уведомления\n"
-        "/unmute — включить уведомления\n"
-        "/help — помощь",
+        "Поиск звука:\n"
+        "@MIFki_bot запрос\n\n"
+        "Добавить в избранное:\n"
+        "@MIFki_bot запрос⭐\n\n"
+        "Избранное:\n"
+        "/favorites\n\n"
+        "Добавить свой звук — отправь сюда аудио или голосовое.\n\n"
+        "Команды: /favorites /favorite /unfavorite /cancel /mute /unmute",
         parse_mode="HTML",
+        reply_markup=keyboard,
     )
 @dp.callback_query(F.data == "show_help")
 async def show_help_button(callback) -> None:
