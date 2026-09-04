@@ -67,25 +67,29 @@ from aiogram.fsm.context import FSMContext
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
     
-    # Текст разбит на визуальные блоки с жирными заголовками для читаемости
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+
+@dp.message(Command("start"), F.chat.type == "private")
+async def start_private_chat(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    
     text = (
-        "Привет! Я <b>MIFs</b> — твой архив голосовых мем-звуков. 🔊\n\n"
-        "<b>Что я умею:</b>\n"
-        "🔍 <b>Искать везде:</b> Пиши @MIFki_bot в любом чате. Если звука нет в базе, я сам скачаю его с MyInstants.\n"
-        "⭐ <b>Сохранять лучшее:</b> Допиши ⭐ в конец запроса, чтобы добавить найденный звук в избранное.\n"
-        "➕ <b>Загружать твоё:</b> Отправь мне аудио или голосовое, а затем напиши название — звук станет доступен всем.\n\n"
-        "<b>Управление:</b>\n"
-        "/mute — отключить уведомления автопоиска (обратно — /unmute)\n"
-        "/cancel — отменить текущую загрузку"
+        "Привет! Я <b>MIFs</b> — бот для поиска и сохранения голосовых мемов. 🔊\n\n"
+        "• Пиши @MIFki_bot в любом чате для быстрого поиска\n"
+        "• Добавь ⭐ в конец запроса, чтобы сохранить звук\n"
+        "• Кидай сюда аудио или голосовое, чтобы добавить свой звук\n\n"
+        "Управление: /mute | /cancel"
     )
 
-    # Кнопка помощи под сообщением
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📖 Открыть помощь", callback_data="cmd_help")]
+            [InlineKeyboardButton(text="📖 Полная помощь", callback_data="cmd_help")]
         ]
     )
 
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    
     # Обязательно передаем parse_mode="HTML", чтобы сработали теги <b>
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
     
