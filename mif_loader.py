@@ -116,27 +116,43 @@ async def _download_audio_ytdlp(url: str) -> bytes:
 async def import_one_sound(
     bot: Bot,
     sound: dict[str, str],
+    notify_func=None,
 ) -> tuple[str, dict[str, Any] | None]:
-    """Скачивает, обрабатывает и публикует звук, полагаясь на yt-dlp."""
+    """Скачивает, обрабатывает и публикует звук с уведомлением пользователя на каждом шаге."""
     title = sound["title"]
     source_type = sound.get("source_type", "myinstants")
     source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
 
     try:
-        audio_bytes = await _download_audio_ytdlp(sound["url"])
+        if source_type == "tiktok":
+            if notify_func:
+                await notify_func(f"📥 [Шаг 2/3] Запускаю парсинг <b>ssstik.io</b> и скачивание MP3 из TikTok...")
+            session = requests.Session()
+            audio_bytes = await asyncio.to_thread(import_tiktok.download_audio, session, sound["url"])
+        else:
+            if notify_func:
+                await notify_func(f"📥 [Шаг 2/3] Скачиваю аудиофайл с MyInstants через <b>yt-dlp</b>...")
+            audio_bytes = await _download_audio_ytdlp(sound["url"])
+            
     except yt_dlp.utils.DownloadError as error:
         await mif_core.report_bug(bot, f"Автозагрузка ({source_label}): yt-dlp не смог скачать «{title}»: {error}")
         return "error", None
-    except Exception as error:
-        await mif_core.report_bug(bot, f"Автозагрузка ({source_label}): непредвиденная ошибка yt-dlp «{title}»: {error}")
+    except import_tiktok.NotAudioContentError as error:
+        await mif_core.report_bug(bot, f"Автозагрузка (TikTok): ssstik отдал не аудио «{title}»: {error}")
         return "error", None
+    except Exception as error:
+        await mif_core.report_bug(bot, f"Автозагрузка ({source_label}): ошибка скачивания «{title}»: {error}")
+        return "error", None
+
+    if notify_func:
+        await notify_func("⚙️ [Шаг 3/3] Обрабатываю звук: конвертация в Voice OGG + распознавание речи...")
 
     try:
         bot_text, transcription_error, ogg_bytes, content_hash = (
             await mif_core.prepare_audio_from_bytes(audio_bytes)
         )
     except RuntimeError as error:
-        await mif_core.report_bug(bot, f"Автозагрузка ({source_label}): не удалось конвертировать «{title}»: {error}")
+        await mif_core.report_bug(bot, f"Автозагрузка ({source_label}): ошибка конвертации «{title}»: {error}")
         return "error", None
 
     displayed_bot_text = bot_text or "Речь не распознана."
@@ -167,7 +183,7 @@ async def import_one_sound(
         logger.warning("Добавлен без авто-описания: %s — %s", title, transcription_error)
 
     return status, new_mif
-
+    
 
 async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> None:
     session = requests.Session()
@@ -253,57 +269,96 @@ async def handle_loads_search(message: Message, query: str) -> None:
         await message.answer('Укажи запрос: /loadsSearch "текст".')
         return
 
-    await message.answer("🔍Ищу ссылки (TikTok / MyInstants)...")
+    status_msg = await message.answer("🔍 <b>[Шаг 1/3]</b> Запускаю параллельный поиск:\n• 🎬 <b>TikTok</b> (таймаут 2.0 сек)\n• 🎵 <b>MyInstants</b>...")
+
+    async def update_status(text: str):
+        try:
+            await status_msg.edit_text(text, parse_mode="HTML")
+        except Exception:
+            pass
 
     session = requests.Session()
     session.headers.update(importer.MYINSTANTS_HEADERS)
 
-    candidates = []
-    source_type = "tiktok"
+    start_time = asyncio.get_running_loop().time()
 
-    try:
-        candidates = await import_tiktok.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR)
-    except Exception:
-        pass
-
-    if not candidates:
-        source_type = "myinstants"
+    # Поиск TikTok с ловлей таймаута
+    async def fetch_tiktok():
         try:
-            candidates = await importer.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR)
+            return await asyncio.wait_for(
+                import_tiktok.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR),
+                timeout=2.0
+            )
+        except asyncio.TimeoutError:
+            return "TIMEOUT"
         except Exception:
-            await message.answer("⚠️Оба источника поиска недоступны. Попробуй позже.")
-            return
+            return []
 
-    if not candidates:
-        await message.answer(f"Ничего похожего на «{query}» не нашлось.")
+    # Поиск MyInstants
+    async def fetch_mi():
+        try:
+            return await importer.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR)
+        except Exception:
+            return []
+
+    tt_res, mi_res = await asyncio.gather(fetch_tiktok(), fetch_mi())
+
+    candidates = []
+    source_type = ""
+
+    # Развилка логики: выбор источника
+    if isinstance(tt_res, list) and tt_res:
+        candidates = tt_res
+        source_type = "tiktok"
+        elapsed = round(asyncio.get_running_loop().time() - start_time, 2)
+        await update_status(
+            f"⚡ <b>Развилка: Выбран TikTok!</b>\n"
+            f"⏱ Ответ получен за {elapsed} сек.\n"
+            f"📌 Найдено: «<i>{candidates[0][1]['title']}</i>»\n\n"
+            f"Перехожу к скачиванию..."
+        )
+    elif mi_res:
+        candidates = mi_res
+        source_type = "myinstants"
+        reason = "⏱ TikTok не успел за 2 сек" if tt_res == "TIMEOUT" else "❌ В TikTok ничего не найдено"
+        await update_status(
+            f"⏳ <b>Развилка: Выбран MyInstants!</b>\n"
+            f"Причина: {reason}.\n"
+            f"📌 Найдено: «<i>{candidates[0][1]['title']}</i>»\n\n"
+            f"Перехожу к скачиванию..."
+        )
+    else:
+        await update_status(f"❌ <b>Ничего не найдено</b> ни в TikTok (таймаут/пусто), ни в MyInstants.")
         return
 
     best_score, sound = candidates[0]
     sound["source_type"] = source_type
-    is_confident_match = best_score >= mif_core.FUZZY_MATCH_THRESHOLD
 
+    # Проверка на дубликат по названию
     existing_by_title = mif_core.find_duplicate_by_title(sound["title"])
     if existing_by_title:
-        await message.answer(f"⚠️«{sound['title']}» уже в базе.")
+        await update_status(f"⚠️ <b>Дубликат!</b> Звук «{sound['title']}» уже сохранен в базе.")
         await message.answer_voice(voice=existing_by_title["file_id"])
         return
 
-    status, entry = await import_one_sound(message.bot, sound)
+    # Запуск загрузки и обработки
+    status, entry = await import_one_sound(message.bot, sound, notify_func=update_status)
 
     if status == "duplicate" and entry:
-        await message.answer(f"⚠️Звук совпадает с «{entry.get('title')}».")
+        await update_status(f"⚠️ <b>Дубликат по аудио-хэшу!</b> Совпадает с «{entry.get('title')}».")
         await message.answer_voice(voice=entry["file_id"])
         return
 
     if status == "added" and entry:
-        source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
-        if is_confident_match:
-            await message.answer(f"✅Загрузил с {source_label} «{entry['title']}».")
-        else:
-            await message.answer(f"Точного совпадения нет, скачал ближайшее: «{entry['title']}».")
+        source_label = "TikTok (ssstik.io)" if source_type == "tiktok" else "MyInstants (yt-dlp)"
+        await update_status(
+            f"✅ <b>Звук успешно добавлен!</b>\n\n"
+            f"<b>Источник:</b> {source_label}\n"
+            f"<b>Название:</b> {entry['title']}"
+        )
         return
 
-    await message.answer("⚠️Не удалось загрузить аудио.")
+    await update_status("⚠️ Ошибка на этапе скачивания или обработки файла.")
 
 
 async def background_internet_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
@@ -312,7 +367,7 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
 
     if not muted:
         try:
-            await bot.send_message(requester_id, f"🔍Ищу в интернете «{query_text}»...")
+            await bot.send_message(requester_id, f"🔍 Ищу в интернете «{query_text}» (параллельный поиск)...")
         except TelegramAPIError:
             can_message = False
 
@@ -326,41 +381,130 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     session = requests.Session()
     session.headers.update(importer.MYINSTANTS_HEADERS)
 
+    # Обертки для фонового поиска
+    async def fetch_tiktok():
+        try:
+            return await asyncio.wait_for(
+                import_tiktok.search_catalog(session, query_text, max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD),
+                timeout=2.0
+            )
+        except Exception:
+            return []
+
+    async def fetch_mi():
+        try:
+            return await importer.search_catalog(session, query_text, max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD, fast_only=True)
+        except Exception:
+            return []
+
+    tt_cands, mi_cands = await asyncio.gather(fetch_tiktok(), fetch_mi())
+
     candidates = []
     source_type = "tiktok"
 
-    try:
-        candidates = await import_tiktok.search_catalog(session, query_text, max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD)
-    except Exception:
-        pass
-
-    if not candidates:
+    if tt_cands:
+        candidates = tt_cands
+    elif mi_cands:
+        candidates = mi_cands
         source_type = "myinstants"
-        try:
-            candidates = await importer.search_catalog(session, query_text, max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD, fast_only=True)
-        except Exception:
-            pass
 
     if not candidates:
-        await notify(f"⚠️Не нашёл: «{query_text}»")
+        await notify(f"⚠️ Не нашёл: «{query_text}»")
         return
 
     _, sound = candidates[0]
     sound["source_type"] = source_type
 
     if mif_core.find_duplicate_by_title(sound["title"]):
-        await notify("✅Готово")
+        await notify("✅ Готово")
         return
 
-    await notify(f"➖Нашёл: «{query_text}» — публикую через yt-dlp...")
+    source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
+    await notify(f"➖ Нашёл: «{query_text}» в {source_label} — публикую...")
     
     try:
         status, entry = await import_one_sound(bot, sound)
         if status in ("added", "duplicate") and entry:
-            await notify("✅Готово")
+            await notify("✅ Готово")
     except Exception:
         pass
 
+async def background_internet_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
+    muted = mif_core.is_muted(requester_id)
+    can_message = True
+
+    status_msg = None
+    if not muted:
+        try:
+            status_msg = await bot.send_message(
+                requester_id, 
+                f"🔍 <b>Автопоиск в интернете:</b> «{query_text}»\nПараллельно опрашиваю TikTok (2с) и MyInstants..."
+            )
+        except TelegramAPIError:
+            can_message = False
+
+    async def notify(text: str) -> None:
+        if not muted and can_message and status_msg:
+            try:
+                await status_msg.edit_text(text, parse_mode="HTML")
+            except TelegramAPIError:
+                pass
+
+    session = requests.Session()
+    session.headers.update(importer.MYINSTANTS_HEADERS)
+
+    start_time = asyncio.get_running_loop().time()
+
+    async def fetch_tiktok():
+        try:
+            return await asyncio.wait_for(
+                import_tiktok.search_catalog(session, query_text, max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD),
+                timeout=2.0
+            )
+        except asyncio.TimeoutError:
+            return "TIMEOUT"
+        except Exception:
+            return []
+
+    async def fetch_mi():
+        try:
+            return await importer.search_catalog(session, query_text, max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD, fast_only=True)
+        except Exception:
+            return []
+
+    tt_res, mi_res = await asyncio.gather(fetch_tiktok(), fetch_mi())
+
+    candidates = []
+    source_type = ""
+
+    if isinstance(tt_res, list) and tt_res:
+        candidates = tt_res
+        source_type = "tiktok"
+        elapsed = round(asyncio.get_running_loop().time() - start_time, 2)
+        await notify(f"⚡ <b>TikTok успел за {elapsed}с!</b>\nНашел: «{candidates[0][1]['title']}»\nЗапускаю ssstik.io...")
+    elif mi_res:
+        candidates = mi_res
+        source_type = "myinstants"
+        reason = "⏱ TikTok превысил 2 сек" if tt_res == "TIMEOUT" else "TikTok не нашел совпадений"
+        await notify(f"⏳ <b>{reason}.</b>\nБеру MyInstants: «{candidates[0][1]['title']}»\nЗапускаю yt-dlp...")
+    else:
+        await notify(f"⚠️ Не нашел «{query_text}» ни в TikTok, ни в MyInstants.")
+        return
+
+    _, sound = candidates[0]
+    sound["source_type"] = source_type
+
+    if mif_core.find_duplicate_by_title(sound["title"]):
+        await notify("✅ Звук с таким названием уже есть в базе.")
+        return
+
+    try:
+        status, entry = await import_one_sound(bot, sound, notify_func=notify)
+        if status in ("added", "duplicate") and entry:
+            await notify(f"✅ <b>Готово!</b> Звук «{entry['title']}» добавлен.")
+    except Exception:
+        await notify("⚠️ Ошибка при обработке звука.")
+        
 
 async def handle_loads_commands(message: Message) -> None:
     text = (message.text or "").strip()
