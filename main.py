@@ -18,6 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    ChosenInlineResult,
     InlineQuery,
     InlineQueryResultCachedAudio,
     InlineQueryResultCachedVoice,
@@ -26,6 +27,7 @@ from aiogram.types import (
 
 import mif_core
 import mif_loader
+import db_manager
 
 logger = logging.getLogger("mif-bot")
 
@@ -86,6 +88,23 @@ async def unmute_command(message: Message) -> None:
     mif_core.unmute_user(message.from_user.id)
     await message.answer("🔔Уведомления об автопоиске снова включены.")
 
+@dp.message(Command("popular"), F.chat.type == "private")
+async def popular_command(message: Message) -> None:
+    top_sounds = db_manager.get_popular_sounds(limit=20)
+    if not top_sounds:
+        await message.answer("Пока никто не пользовался ни одним звуком — рейтинг пуст.")
+        return
+
+    lines = [f"{index}. {mif.get('title', 'без названия')}" for index, mif in enumerate(top_sounds, start=1)]
+    await message.answer("🏆Топ-20 самых популярных звуков:\n\n" + "\n".join(lines))
+
+
+@dp.message(Command("clear_history"), F.chat.type == "private")
+async def clear_history_command(message: Message) -> None:
+    if message.from_user is None:
+        return
+    db_manager.clear_history(message.from_user.id)
+    await message.answer("🗑История использования очищена. Избранное осталось без изменений.")
 
 # ⚠️ НАПОМИНАЛКА СЕБЕ: /help — единственное место, где обычные пользователи
 # видят список команд. Каждый раз, когда добавляешь новую команду или
@@ -114,7 +133,11 @@ HELP_TEXT = (
     "<b>Уведомления:</b>\n"
     "/mute — отключить сообщения об автопоиске в личке.\n"
     "/unmute — включить обратно.\n\n"
-    "/help — показать это сообщение ещё раз."
+    "/help — показать это сообщение ещё раз.\n\n"
+    "<b>Избранное и история:</b>\n"
+    "/popular — топ-20 самых популярных звуков среди всех.\n"
+    "/clear_history — очистить свою историю использованных звуков "
+    "(избранное не трогает).\n\n"
 )
 
 
@@ -293,7 +316,18 @@ async def handle_unknown_command(message: Message) -> None:
 
 @dp.inline_query()
 async def search_mifs(query: InlineQuery) -> None:
-    matches, best_score = mif_core.find_matching_mifs(query.query)
+    query_text = query.query.strip()
+
+    if not query_text:
+        # Пустой запрос — не обычный поиск, а персональное меню: избранное +
+        # история (или глобальный топ для новых пользователей). Логика в
+        # db_manager, а не в mif_core.find_matching_mifs — иначе получился
+        # бы циклический импорт (db_manager уже импортирует mif_core).
+        matches = db_manager.get_personal_menu(query.from_user.id)
+        best_score = 100.0
+    else:
+        matches, best_score = mif_core.find_matching_mifs(query_text)
+
     results = []
 
     for mif in matches:
@@ -302,8 +336,6 @@ async def search_mifs(query: InlineQuery) -> None:
         file_type = mif.get("file_type", mif.get("media_type", "voice"))
         title = str(mif.get("title", mif.get("user_description", "Звук")))
 
-        # Пересылаем чистый звук без подписи, авторства и лишнего текста —
-        # ровно то, что просили: файл берётся напрямую из "базы" канала.
         if file_type == "audio":
             results.append(
                 InlineQueryResultCachedAudio(
@@ -326,6 +358,9 @@ async def search_mifs(query: InlineQuery) -> None:
         is_personal=True,
     )
 
+    if query_text and best_score < mif_core.FUZZY_MATCH_THRESHOLD:
+        mif_loader.schedule_background_lookup(query.bot, query.from_user.id, query_text)
+
     # Локальный поиск дал слабое совпадение (или вообще ничего) — планируем
     # фоновый поиск на MyInstants через debounce (не запускаем сразу: пока
     # человек печатает запрос по буквам, инлайн-событие прилетает на каждое
@@ -334,10 +369,12 @@ async def search_mifs(query: InlineQuery) -> None:
     # результата здесь: инлайн-ответ Telegram должен прийти быстро, а
     # скачивание+конвертация+публикация занимают секунды. Если получится —
     # mif_loader сам пришлёт находку личным сообщением автору запроса.
-    query_text = query.query.strip()
-    if query_text and best_score < mif_core.FUZZY_MATCH_THRESHOLD:
-        mif_loader.schedule_background_lookup(query.bot, query.from_user.id, query_text)
-
+    # Приходит, только если у бота включена inline-обратная связь в BotFather
+# (/setinlinefeedback → 100%) — без этого Telegram вообще не присылает,
+# какой инлайн-результат выбрали, и record_usage никогда не вызовется.
+@dp.chosen_inline_result()
+async def track_chosen_result(chosen: ChosenInlineResult) -> None:
+    db_manager.record_usage(chosen.from_user.id, chosen.result_id)
 
 async def main() -> None:
     bot_token = os.getenv("BOT_TOKEN")

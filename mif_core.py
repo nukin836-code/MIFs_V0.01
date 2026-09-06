@@ -167,6 +167,14 @@ def find_duplicate_by_hash(content_hash: str) -> dict[str, Any] | None:
             return mif
     return None
 
+def get_mif_by_id(mif_id: int | str) -> dict[str, Any] | None:
+    """Резолвит ID звука в полную запись. Нужно db_manager.py: Users DB и
+    Popular DB хранят только ID, а не целые записи."""
+    mif_id = str(mif_id)
+    for mif in MIFS_DATABASE:
+        if str(mif.get("id")) == mif_id:
+            return mif
+    return None
 
 def find_duplicate_by_title(title: str) -> dict[str, Any] | None:
     title_key = title.strip().lower()
