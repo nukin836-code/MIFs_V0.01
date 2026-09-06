@@ -112,64 +112,66 @@ def download_audio(session: requests.Session, tiktok_page_url: str) -> bytes:
         "Referer": "https://ssstik.io/ru",
     }
     
-    post_url = "https://ssstik.io/abc?url=dl"
-    data = {
-        "id": tiktok_page_url,
-        "locale": "ru",
-        "tt": ""
-    }
-    
     try:
-        logger.info("🌐 Стучимся в ssstik.io для парсинга медиа...")
+        # ШАГ 1: Заходим на главную и парсим живой токен 'tt'
+        logger.info("🌐 Получаем динамический токен защиты с ssstik.io...")
+        main_resp = session.get("https://ssstik.io/ru", headers=headers, timeout=7)
+        main_resp.raise_for_status()
+        
+        main_soup = BeautifulSoup(main_resp.text, 'html.parser')
+        tt_input = main_soup.find('input', {'name': 'tt'})
+        tt_value = tt_input['value'] if tt_input and 'value' in tt_input.attrs else ""
+        
+        logger.info("🔑 Токен tt получен: '%s'", tt_value)
+
+        # ШАГ 2: Отправляем запрос на парсинг с настоящим токеном
+        post_url = "https://ssstik.io/abc?url=dl"
+        data = {
+            "id": tiktok_page_url,
+            "locale": "ru",
+            "tt": tt_value
+        }
+        
         resp = session.post(post_url, data=data, headers=headers, timeout=10)
-        logger.info("📥 Ответ от ssstik.io получен. Статус: %s, Размер: %s байт", resp.status_code, len(resp.text))
         resp.raise_for_status()
         
         soup = BeautifulSoup(resp.text, 'html.parser')
         
         mp3_link = None
-        all_links = [a['href'] for a in soup.find_all('a', href=True)]
-        logger.info("🔗 Найдено всего ссылок в ответе ssstik: %d", len(all_links))
-        
+        # Ищем ссылку на аудио/видео
         for a in soup.find_all('a', href=True):
             href = a['href']
+            text = a.text.lower()
             if "dl" in href or "mp3" in href or "tikcdn" in href:
-                if "download" in a.text.lower() or "mp3" in a.text.lower() or "аудио" in a.text.lower():
+                if "download" in text or "mp3" in text or "аудио" in text:
                     mp3_link = href
-                    logger.info("🎵 Найдена явная аудио-ссылка в ssstik: %s", mp3_link)
                     break
                     
         if not mp3_link:
-            logger.info("⚠️ Явная аудио-ссылка не найдена, ищем любую медиа-ссылку (.mp4 / .mp3 / tikcdn)...")
             for a in soup.find_all('a', href=True):
                 href = a['href']
                 if "tikcdn" in href or ".mp4" in href or ".mp3" in href:
                     mp3_link = href
-                    logger.info("🎵 Найдена альтернативная медиа-ссылка: %s", mp3_link)
                     break
                     
         if not mp3_link:
-            logger.error("❌ Не удалось найти прямую ссылку на медиа в ответе ssstik. HTML ответ: %s", resp.text[:500])
-            raise NotAudioContentError("Не удалось извлечь прямую ссылку на аудио из ответов ssstik.")
+            raise NotAudioContentError("ssstik.io не отдала ссылку на скачивание.")
             
         if not mp3_link.startswith("http"):
             mp3_link = "https:" + mp3_link if mp3_link.startswith("//") else "https://ssstik.io" + mp3_link
 
-        logger.info("⬇️ Скачиваем медиафайл по ссылке: %s", mp3_link)
+        # ШАГ 3: Скачиваем сам медиафайл
+        logger.info("⬇️ Скачиваем байты: %s", mp3_link)
         audio_resp = session.get(mp3_link, timeout=15)
-        logger.info("📥 Ответ медиасервера получен. Статус: %s, Размер: %s байт", audio_resp.status_code, len(audio_resp.content))
         audio_resp.raise_for_status()
         
         content_type = audio_resp.headers.get("Content-Type", "").lower()
-        logger.info("📄 Content-Type скачанного файла: %s", content_type)
-        
         if "text" in content_type or "html" in content_type:
-            raise NotAudioContentError(f"Скачался не аудиофайл, а страница с ошибкой/капчей (content-type: {content_type}).", content_type=content_type)
+            raise NotAudioContentError(f"Скачался HTML вместо аудио (content-type: {content_type}).")
             
-        logger.info("✅ Аудио успешно скачано из TikTok! Передаем в мясорубку.")
         return audio_resp.content
 
     except Exception as e:
-        logger.exception("🚨 Ошибка при скачивании аудио через ssstik: %s", e)
+        logger.exception("🚨 Ошибка при скачивании через ssstik: %s", e)
         raise
         

@@ -56,6 +56,28 @@ class _UserLookupState:
 
 _user_lookup_states: dict[int, _UserLookupState] = {}
 
+def is_valid_audio_bytes(data: bytes) -> bool:
+    """Проверяет байты на реальные сигнатуры аудио/видео форматов."""
+    if len(data) < 5000:
+        return False
+
+    # Если в первых 1000 байтах есть символы HTML — это веб-страница/капча
+    head = data[:1000].lower()
+    if b"<html" in head or b"<!doctype" in head or b"<head" in head or b'{"error"' in head or b"<script" in head:
+        return False
+
+    # Проверка Magic Bytes (заголовков настоящих медиафайлов)
+    is_mp3 = data.startswith(b"ID3") or data.startswith(b"\xff\xfb") or data.startswith(b"\xff\xf3")
+    is_ogg = data.startswith(b"OggS")
+    is_wav = data.startswith(b"RIFF") and b"WAVE" in data[:16]
+    is_flac = data.startswith(b"fLaC")
+    is_mp4 = len(data) > 8 and data[4:8] == b"ftyp"
+    is_webm = data.startswith(b"\x1a\x45\xdf\xa3")
+
+    # Если совпал хотя бы один сигнатурный заголовок медиа
+    return is_mp3 or is_ogg or is_wav or is_flac or is_mp4 or is_webm
+    
+
 
 def schedule_background_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
     state = _user_lookup_states.setdefault(requester_id, _UserLookupState())
