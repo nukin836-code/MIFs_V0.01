@@ -101,77 +101,26 @@ async def search_catalog(
             await mif_core.report_bug(bot, f"⚠️ import_tiktok search error: {e}")
         return []
 
+from urllib.parse import quote_plus
+
 def download_audio(session: requests.Session, tiktok_page_url: str) -> bytes:
-    logger.info("📥 [TIKTOK DOWNLOAD START] Скачивание для ссылки: %s", tiktok_page_url)
+    logger.info("📥 [TIKTOK DOWNLOAD START] Запрос к нашему локальному серверу для: %s", tiktok_page_url)
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "HX-Request": "true",
-        "HX-Current-URL": "https://ssstik.io/ru",
-        "Origin": "https://ssstik.io",
-        "Referer": "https://ssstik.io/ru",
-    }
+    # Стучимся на твой локальный FastAPI сервер, запущенный в Termux
+    local_api_url = f"http://127.0.0.1:8000/download?url={quote_plus(tiktok_page_url)}"
     
     try:
-        # ШАГ 1: Заходим на главную и парсим живой токен 'tt'
-        logger.info("🌐 Получаем динамический токен защиты с ssstik.io...")
-        main_resp = session.get("https://ssstik.io/ru", headers=headers, timeout=7)
-        main_resp.raise_for_status()
-        
-        main_soup = BeautifulSoup(main_resp.text, 'html.parser')
-        tt_input = main_soup.find('input', {'name': 'tt'})
-        tt_value = tt_input['value'] if tt_input and 'value' in tt_input.attrs else ""
-        
-        logger.info("🔑 Токен tt получен: '%s'", tt_value)
-
-        # ШАГ 2: Отправляем запрос на парсинг с настоящим токеном
-        post_url = "https://ssstik.io/abc?url=dl"
-        data = {
-            "id": tiktok_page_url,
-            "locale": "ru",
-            "tt": tt_value
-        }
-        
-        resp = session.post(post_url, data=data, headers=headers, timeout=10)
-        resp.raise_for_status()
-        
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        mp3_link = None
-        # Ищем ссылку на аудио/видео
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            text = a.text.lower()
-            if "dl" in href or "mp3" in href or "tikcdn" in href:
-                if "download" in text or "mp3" in text or "аудио" in text:
-                    mp3_link = href
-                    break
-                    
-        if not mp3_link:
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if "tikcdn" in href or ".mp4" in href or ".mp3" in href:
-                    mp3_link = href
-                    break
-                    
-        if not mp3_link:
-            raise NotAudioContentError("ssstik.io не отдала ссылку на скачивание.")
+        resp = session.get(local_api_url, timeout=25)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Локальный сервер вернул ошибку {resp.status_code}: {resp.text}")
             
-        if not mp3_link.startswith("http"):
-            mp3_link = "https:" + mp3_link if mp3_link.startswith("//") else "https://ssstik.io" + mp3_link
-
-        # ШАГ 3: Скачиваем сам медиафайл
-        logger.info("⬇️ Скачиваем байты: %s", mp3_link)
-        audio_resp = session.get(mp3_link, timeout=15)
-        audio_resp.raise_for_status()
-        
-        content_type = audio_resp.headers.get("Content-Type", "").lower()
-        if "text" in content_type or "html" in content_type:
-            raise NotAudioContentError(f"Скачался HTML вместо аудио (content-type: {content_type}).")
+        if len(resp.content) == 0:
+            raise RuntimeError("Локальный сервер отдал пустой файл (0 байт).")
             
-        return audio_resp.content
-
+        logger.info("✅ Аудио успешно получено через наш локальный сервер! Размер: %d байт", len(resp.content))
+        return resp.content
+        
     except Exception as e:
-        logger.exception("🚨 Ошибка при скачивании через ssstik: %s", e)
+        logger.exception("🚨 Ошибка при скачивании через локальный сервер TikTok: %s", e)
         raise
         
