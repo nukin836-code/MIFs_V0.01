@@ -18,7 +18,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    CallbackQuery,
     ChosenInlineResult,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultCachedAudio,
     InlineQueryResultCachedVoice,
@@ -40,45 +43,77 @@ class AddMif(StatesGroup):
     waiting_for_description = State()
 
 
-@dp.message(Command("cancel"), F.chat.type == "private")
-async def cancel_addition(message: Message, state: FSMContext) -> None:
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer("Сейчас нечего отменять.")
-        return
+# --- /start с выбором языка ---------------------------------------------------
 
-    await state.clear()
-    await message.answer("Добавление звука отменено.")
+_LANG_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[[
+        InlineKeyboardButton(text="🇷🇺 Русский",    callback_data="lang_ru"),
+        InlineKeyboardButton(text="🇬🇧 English",    callback_data="lang_en"),
+        InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang_ua"),
+    ]]
+)
+
+_START_TEXTS: dict[str, str] = {
+    "ru": (
+        "🔊 <b>MIFki Bot</b>\n\n"
+        "Ищи звуки через инлайн: <code>@MIFki_bot запрос</code>\n"
+        "Добавь свой — пришли аудиофайл в этот чат.\n\n"
+        "/help — все команды"
+    ),
+    "en": (
+        "🔊 <b>MIFki Bot</b>\n\n"
+        "Search sounds via inline: <code>@MIFki_bot query</code>\n"
+        "Add your own — send an audio file here.\n\n"
+        "/help — all commands"
+    ),
+    "ua": (
+        "🔊 <b>MIFki Bot</b>\n\n"
+        "Шукай звуки через інлайн: <code>@MIFki_bot запит</code>\n"
+        "Додай свій — надішли аудіофайл у цей чат.\n\n"
+        "/help — всі команди"
+    ),
+}
 
 
 @dp.message(Command("start"), F.chat.type == "private")
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Привет! Я бот для поиска и загрузки голосовых мем-звуков (MIF).\n\n"
-        "Что я умею:\n"
-        "🔍 Умный поиск: Пиши в любом чате через инлайн-режим (@MIFki_bot) "
-        "— мгновенно поищу звук в базе, а если его нет — автоматически "
-        "сбегаю на MyInstants и добавлю. О статусе напишу в личку.\n"
-        "➕ Добавление своих звуков:\n"
-        "1. Отправь мне аудиофайл или голосовое.\n"
-        "2. Напиши название и теги следующим сообщением.\n"
-        "Звук сразу улетит в канал и станет доступен всем.\n\n"
-        "Не хочешь получать уведомления об автопоиске — /mute (обратно — /unmute).\n"
-        "Для отмены загрузки в любой момент — /cancel."
+        "👋 Выбери язык / Choose language / Обери мову:",
+        reply_markup=_LANG_KEYBOARD,
     )
 
+
+@dp.callback_query(F.data.startswith("lang_"))
+async def handle_language_choice(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    lang = (callback.data or "lang_ru").split("_", 1)[-1]
+    text = _START_TEXTS.get(lang, _START_TEXTS["ru"])
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await callback.answer()
+
+
+# --- /cancel ------------------------------------------------------------------
+
+@dp.message(Command("cancel"), F.chat.type == "private")
+async def cancel_addition(message: Message, state: FSMContext) -> None:
+    if await state.get_state() is None:
+        await message.answer("Сейчас нечего отменять.")
+        return
+    await state.clear()
+    await message.answer("Добавление звука отменено.")
+
+
+# --- /mute / /unmute ----------------------------------------------------------
 
 @dp.message(Command("mute"), F.chat.type == "private")
 async def mute_command(message: Message) -> None:
     if message.from_user is None:
         return
     mif_core.mute_user(message.from_user.id)
-    await message.answer(
-        "🔕Уведомления об автопоиске отключены — искать и добавлять звуки "
-        "буду по-прежнему, просто больше не буду писать тебе об этом. "
-        "Включить обратно — /unmute."
-    )
+    await message.answer("🔕 Уведомления отключены. Включить — /unmute.")
 
 
 @dp.message(Command("unmute"), F.chat.type == "private")
@@ -86,17 +121,22 @@ async def unmute_command(message: Message) -> None:
     if message.from_user is None:
         return
     mif_core.unmute_user(message.from_user.id)
-    await message.answer("🔔Уведомления об автопоиске снова включены.")
+    await message.answer("🔔 Уведомления включены.")
+
+
+# --- /popular / /clear_history ------------------------------------------------
 
 @dp.message(Command("popular"), F.chat.type == "private")
 async def popular_command(message: Message) -> None:
     top_sounds = db_manager.get_popular_sounds(limit=20)
     if not top_sounds:
-        await message.answer("Пока никто не пользовался ни одним звуком — рейтинг пуст.")
+        await message.answer("Рейтинг пока пуст.")
         return
-
-    lines = [f"{index}. {mif.get('title', 'без названия')}" for index, mif in enumerate(top_sounds, start=1)]
-    await message.answer("🏆Топ-20 самых популярных звуков:\n\n" + "\n".join(lines))
+    lines = [
+        f"{i}. {mif.get('title', 'без названия')}"
+        for i, mif in enumerate(top_sounds, 1)
+    ]
+    await message.answer("🏆 Топ-20 звуков:\n\n" + "\n".join(lines))
 
 
 @dp.message(Command("clear_history"), F.chat.type == "private")
@@ -104,52 +144,72 @@ async def clear_history_command(message: Message) -> None:
     if message.from_user is None:
         return
     db_manager.clear_history(message.from_user.id)
-    await message.answer("🗑История использования очищена. Избранное осталось без изменений.")
+    await message.answer("🗑 История очищена. Избранное не тронуто.")
 
-# ⚠️ НАПОМИНАЛКА СЕБЕ: /help — единственное место, где обычные пользователи
-# видят список команд. Каждый раз, когда добавляешь новую команду или
-# меняешь поведение существующей — обнови текст ниже. Сюда идут ТОЛЬКО
-# команды, доступные обычным людям. Админские (/loads, /loadsN, /loadsStop)
-# сюда НЕ добавлять — их не должно быть видно в общем /help.
+
+# --- /help --------------------------------------------------------------------
+
+# ⚠️ НАПОМИНАЛКА: при добавлении/изменении команд — обновляй HELP_TEXT.
+# Только пользовательские команды. Админские (/loads и т.д.) — сюда не.
 HELP_TEXT = (
-    "🔊 <b>MIFs — звуковые мемы</b>\n\n"
-    "<b>Найти звук:</b>\n"
-    "В любом чате набери <code>@MIFki_bot запрос</code> — появится список "
-    "подходящих звуков. Можно вводить несколько слов в любом порядке "
-    "(например: «котик мем»).\n"
-    "Если в базе ничего не нашлось, бот сам поищет на MyInstants. Статус "
-    "придёт в личку: 🔍 ищу → ➖ нашёл, публикую → ✅ готово (или ⚠️ не "
-    "нашёл). Сам файл в личку не присылается — как будет готово, найдёшь "
-    "его тем же инлайн-поиском.\n\n"
-    "<b>Добавить свой звук:</b>\n"
-    "1. Пришли мне аудиофайл или голосовое сообщение.\n"
-    "2. Следующим сообщением напиши название и теги.\n"
-    "Звук опубликуется в @MIFFFKI и станет доступен в поиске.\n"
-    "Отменить незавершённое добавление — /cancel.\n\n"
-    "<b>Загрузить конкретный звук с MyInstants:</b>\n"
-    '<code>/loadsSearch "запрос"</code> — найду и загружу звук по названию. '
-    "Если он уже есть в базе — пришлю уже существующую версию, а не буду "
-    "публиковать заново.\n\n"
-    "<b>Уведомления:</b>\n"
-    "/mute — отключить сообщения об автопоиске в личке.\n"
-    "/unmute — включить обратно.\n\n"
-    "/help — показать это сообщение ещё раз.\n\n"
-    "<b>Избранное и история:</b>\n"
-    "/popular — топ-20 самых популярных звуков среди всех.\n"
-    "/clear_history — очистить свою историю использованных звуков "
-    "(избранное не трогает).\n\n"
+    "🔊 <b>MIFki</b>\n\n"
+    "<code>@MIFki_bot запрос</code> — найти звук в любом чате\n\n"
+    "/popular — топ-20 популярных звуков\n"
+    "/clear_history — очистить свою историю\n"
+    "/mute · /unmute — уведомления об автопоиске\n"
+    "/cancel — отменить добавление звука\n\n"
+    "<b>Добавить звук:</b> пришли аудиофайл → напиши описание\n\n"
+    '/loadsSearch "текст" — найти и добавить звук из интернета'
+)
+
+_HELP_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[[
+        InlineKeyboardButton(text="ℹ️ /info — о боте", callback_data="show_info"),
+    ]]
 )
 
 
 @dp.message(Command("help"), F.chat.type == "private")
 async def show_help(message: Message) -> None:
-    await message.answer(HELP_TEXT, parse_mode="HTML")
+    await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=_HELP_KEYBOARD)
 
+
+# --- /info --------------------------------------------------------------------
+
+def _build_info_text() -> str:
+    count = len(mif_core.MIFS_DATABASE)
+    return (
+        "ℹ️ <b>MIFki Bot</b>\n\n"
+        f"Звуков в базе: <b>{count}</b>\n"
+        "Канал: @MIFFFKI\n"
+        "Поиск: @MIFki_bot\n\n"
+        "Источники: MyInstants · TikTok\n"
+        "Распознавание: Google STT (ru + en)\n"
+        "Дедупликация: SHA-256 аудиохэш\n"
+        "Защита от дублей: asyncio.Lock"
+    )
+
+
+@dp.message(Command("info"), F.chat.type == "private")
+async def show_info(message: Message) -> None:
+    await message.answer(_build_info_text(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "show_info")
+async def handle_info_button(callback: CallbackQuery) -> None:
+    # Отправляем новым сообщением, чтобы клавиатура /help оставалась видна
+    await callback.message.answer(_build_info_text(), parse_mode="HTML")
+    await callback.answer()
+
+
+# --- /loads* ------------------------------------------------------------------
 
 @dp.message(F.chat.type == "private", F.text.startswith("/loads"))
 async def loads_commands(message: Message) -> None:
     await mif_loader.handle_loads_commands(message)
 
+
+# --- Загрузка аудио пользователем --------------------------------------------
 
 @dp.message(F.chat.type == "private", F.audio | F.voice)
 async def handle_audio_upload(message: Message, state: FSMContext) -> None:
@@ -165,11 +225,9 @@ async def handle_audio_upload(message: Message, state: FSMContext) -> None:
 
     await state.update_data(file_id=file_id, file_type=file_type)
     await state.set_state(AddMif.waiting_for_description)
-
     await message.answer(
-        "✅Аудио получено!\n"
-        "⚠️Теперь обязательно отправь описание и теги.\n"
-        "Для отмены отправь /cancel."
+        "✅ Аудио получено!\n"
+        "Теперь отправь описание и теги. /cancel — отменить."
     )
 
 
@@ -182,13 +240,12 @@ async def handle_description(message: Message, state: FSMContext) -> None:
     user_description = (message.text or "").strip()
 
     if not user_description:
-        await message.answer("⚠️Описание не может быть пустым.")
+        await message.answer("⚠️ Описание не может быть пустым.")
         return
 
     if len(user_description) > MAX_DESCRIPTION_LENGTH:
         await message.answer(
-            f"⚠️Описание слишком длинное. Используй не более "
-            f"{MAX_DESCRIPTION_LENGTH} символов."
+            f"⚠️ Описание слишком длинное (макс. {MAX_DESCRIPTION_LENGTH} символов)."
         )
         return
 
@@ -198,23 +255,20 @@ async def handle_description(message: Message, state: FSMContext) -> None:
 
     if not isinstance(file_id, str) or file_type not in {"audio", "voice"}:
         await state.clear()
-        await message.answer("Срок ожидания описания истёк. Отправь аудио ещё раз.")
+        await message.answer("Срок ожидания истёк. Отправь аудио ещё раз.")
         return
 
-    await message.answer("⏳Распознаю слова и готовлю голосовое сообщение...")
+    await message.answer("⏳ Распознаю речь и готовлю файл...")
 
     try:
-        bot_description, transcription_error, ogg_bytes, content_hash = await mif_core.prepare_audio(
-            message.bot,
-            file_id,
-            file_type,
+        bot_description, transcription_error, ogg_bytes, content_hash = (
+            await mif_core.prepare_audio(message.bot, file_id, file_type)
         )
     except RuntimeError as error:
         logger.exception("Не удалось подготовить аудио к публикации")
         await message.answer(
-            f"⚠️{error}\n"
-            "Добавление не отменено — можно отправить описание ещё раз "
-            "или использовать /cancel."
+            f"⚠️ {error}\n"
+            "Добавление не отменено — отправь описание ещё раз или /cancel."
         )
         return
 
@@ -250,91 +304,75 @@ async def handle_description(message: Message, state: FSMContext) -> None:
     except TelegramAPIError:
         logger.exception("Не удалось опубликовать MIF в канале %s", mif_core.CHANNEL_ID)
         await message.answer(
-            "⚠️Не удалось отправить звук в канал. Проверь, что бот добавлен "
-            "администратором @MIFFFKI и имеет право публиковать сообщения.\n"
-            "Добавление не отменено — можно исправить права и отправить описание ещё раз "
-            "или использовать /cancel."
+            "⚠️ Не удалось отправить в канал.\n"
+            "Добавление не отменено — попробуй ещё раз или /cancel."
         )
         return
 
     await state.clear()
 
     if status == "duplicate":
-        # Проверка дубликата теперь атомарна внутри publish_voice_mif (под
-        # локом, вместе с самой публикацией) — это защищает от гонки, когда
-        # /loads или фоновый автопоиск публикуют тот же звук почти
-        # одновременно с ручной загрузкой.
         duplicate_title = new_mif.get("title") or "без названия"
         await message.answer(
-            f"⚠️Такой звук уже есть в базе: «{duplicate_title}». "
-            "Повторно не публикую.\n"
-            "Если тебе кажется, что это ошибка — обрежь/измени файл немного "
-            "и пришли ещё раз."
+            f"⚠️ Такой звук уже есть в базе: «{duplicate_title}».\n"
+            "Обрежь или измени файл, если думаешь, что это ошибка."
         )
         return
 
     if transcription_error:
         await message.answer(
-            "✅Файл опубликован в @MIFFFKI и добавлен в поиск.\n"
-            f"⚠️Авто-описание: {transcription_error}\n"
-            "Описание и теги пользователя сохранены."
+            "✅ Опубликовано в @MIFFFKI.\n"
+            f"⚠️ Авто-описание: {transcription_error}"
         )
     else:
         await message.answer(
-            "✅Файл опубликован в @MIFFFKI и добавлен в поиск.\n"
+            "✅ Опубликовано в @MIFFFKI.\n"
             f"Авто-описание: {new_mif['bot_description']}"
         )
 
 
 @dp.message(AddMif.waiting_for_description, F.chat.type == "private")
 async def handle_non_text_description(message: Message) -> None:
-    await message.answer(
-        "⚠️Теперь обязательно отправь текстовое описание и теги "
-        "или используй /cancel."
-    )
+    await message.answer("⚠️ Отправь текстовое описание или /cancel.")
 
 
-# Ловушка на любую нераспознанную команду. Стоит ПОСЛЕДНЕЙ среди хендлеров
-# приватного чата — сработает только если ничего более специфичное выше не
-# подошло. Смысл — бот никогда не должен молчать в ответ на команду, даже
-# если это опечатка.
+# --- Неизвестные команды (ловушка, стоит последней) --------------------------
+
 @dp.message(F.chat.type == "private", F.text.startswith("/"))
 async def handle_unknown_command(message: Message) -> None:
     text = (message.text or "").strip()
     hint = ""
-    if text.lower().startswith("/load") and text.lower() != "/loads":
+    if text.lower().startswith("/load") and not text.lower().startswith("/loads"):
         hint = (
-            "\nПохоже, это опечатка в команде автозагрузки — она называется "
-            "именно <code>/loads</code> (с «s» на конце)."
+            "\nПохоже, опечатка — команда называется "
+            "<code>/loads</code> (с «s» на конце)."
         )
     await message.answer(
-        f"Не знаю такую команду: {html.escape(text)}.{hint}\n"
-        "Список доступных команд — /help.",
+        f"Не знаю команду: {html.escape(text)}.{hint}\n/help — список команд.",
         parse_mode="HTML",
     )
 
+
+# --- Инлайн-поиск ------------------------------------------------------------
 
 @dp.inline_query()
 async def search_mifs(query: InlineQuery) -> None:
     query_text = query.query.strip()
 
     if not query_text:
-        # Пустой запрос — не обычный поиск, а персональное меню: избранное +
-        # история (или глобальный топ для новых пользователей). Логика в
-        # db_manager, а не в mif_core.find_matching_mifs — иначе получился
-        # бы циклический импорт (db_manager уже импортирует mif_core).
+        # Пустой запрос — персональное меню: избранное + история (или глобальный
+        # топ для новых пользователей). Логика в db_manager.
         matches = db_manager.get_personal_menu(query.from_user.id)
         best_score = 100.0
     else:
         matches, best_score = mif_core.find_matching_mifs(query_text)
 
     results = []
-
     for mif in matches:
-        mif_id = str(mif.get("id", ""))
-        file_id = str(mif.get("file_id", ""))
+        mif_id   = str(mif.get("id", ""))
+        file_id  = str(mif.get("file_id", ""))
         file_type = mif.get("file_type", mif.get("media_type", "voice"))
-        title = str(mif.get("title", mif.get("user_description", "Звук")))
+        title    = str(mif.get("title", mif.get("user_description", "Звук")))
 
         if file_type == "audio":
             results.append(
@@ -352,29 +390,23 @@ async def search_mifs(query: InlineQuery) -> None:
                 )
             )
 
-    await query.answer(
-        results=results,
-        cache_time=1,
-        is_personal=True,
-    )
+    await query.answer(results=results, cache_time=1, is_personal=True)
 
+    # Локальный поиск дал слабое совпадение — планируем фоновый поиск на
+    # MyInstants/TikTok через debounce (не сразу: пока человек печатает,
+    # инлайн-событие прилетает на каждую букву). НЕ делаем это до
+    # query.answer(): инлайн-ответ должен приходить быстро.
     if query_text and best_score < mif_core.FUZZY_MATCH_THRESHOLD:
         mif_loader.schedule_background_lookup(query.bot, query.from_user.id, query_text)
 
-    # Локальный поиск дал слабое совпадение (или вообще ничего) — планируем
-    # фоновый поиск на MyInstants через debounce (не запускаем сразу: пока
-    # человек печатает запрос по буквам, инлайн-событие прилетает на каждое
-    # изменение текста — schedule_background_lookup сама разберётся, когда
-    # печатать закончили). НЕ делаем это до query.answer() и не ждём
-    # результата здесь: инлайн-ответ Telegram должен прийти быстро, а
-    # скачивание+конвертация+публикация занимают секунды. Если получится —
-    # mif_loader сам пришлёт находку личным сообщением автору запроса.
-    # Приходит, только если у бота включена inline-обратная связь в BotFather
-# (/setinlinefeedback → 100%) — без этого Telegram вообще не присылает,
-# какой инлайн-результат выбрали, и record_usage никогда не вызовется.
+
+# Приходит только если в BotFather включена inline-обратная связь
+# (/setinlinefeedback → 100%) — без этого Telegram вообще не присылает
+# chosen_inline_result и record_usage никогда не вызовется.
 @dp.chosen_inline_result()
 async def track_chosen_result(chosen: ChosenInlineResult) -> None:
     db_manager.record_usage(chosen.from_user.id, chosen.result_id)
+
 
 async def main() -> None:
     bot_token = os.getenv("BOT_TOKEN")
@@ -395,3 +427,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
