@@ -118,5 +118,35 @@
     "channel_message_id": 501,
     "content_hash": "166bf78c274b884d7cc3eff9c8c55e928e2385b59c676aa4ad150927576a2208",
     "source_url": "https://www.myinstants.com/media/sounds/i-am-the-best-programmer-on-earth.mp3"
+  },
+  {
+    "id": "9",
+    "title": "Hell yeah!",
+    "file_id": "AwACAgIAAyEGAAMBAAHYslQAAgH2ap_36-C3Iy5ed-Ky04v67rv2RZUAAne0AAIHqwABSanXTV-mys42PQQ",
+    "file_type": "voice",
+    "media_type": "voice",
+    "user_description": "Hell yeah!",
+    "bot_description": "hell yeah",
+    "user_tags": "hell yeah!",
+    "bot_tags": "hell yeah",
+    "tags": "hell yeah!",
+    "channel_message_id": 502,
+    "content_hash": "dcbbabf4e4b3d8dcdd10d5a22e6133bc7e347b2a47293b9a66d077ef0c68eb28",
+    "source_url": "https://www.myinstants.com/media/sounds/hell-yeah.mp3"
+  },
+  {
+    "id": "10",
+    "title": "Я ТЕБЯ МОГНУ",
+    "file_id": "AwACAgIAAyEGAAMBAAHYslQAAgH3ap_6G51dtOQmTYx0hmZY0ib4KMQAAqe0AAIHqwABSWu-OsgkFaVzPQQ",
+    "file_type": "voice",
+    "media_type": "voice",
+    "user_description": "Я ТЕБЯ МОГНУ",
+    "bot_description": "Ты слишком низкий А я люблю высокий я тебя модную я тебе могу я тебя могу",
+    "user_tags": "я тебя могну",
+    "bot_tags": "ты слишком низкий а я люблю высокий я тебя модную я тебе могу я тебя могу",
+    "tags": "я тебя могну",
+    "channel_message_id": 503,
+    "content_hash": "9f515ec915490d221edeaa1ed23e907f018b2fda77c3edf6d5fbb7ad23ec295e",
+    "source_url": "https://www.myinstants.com/media/sounds/ia-tebia-mognu.mp3"
   }
 ]
