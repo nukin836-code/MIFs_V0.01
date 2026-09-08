@@ -74,6 +74,35 @@ _START_TEXTS: dict[str, str] = {
     ),
 }
 
+from aiogram import Router
+from aiogram.types import InlineQuery, InlineQueryResultArticle, InputTextMessageContent
+
+router = Router()
+
+@router.inline_query()
+async def inline_search(inline_query: InlineQuery):
+    text = inline_query.query.strip()
+    
+    # 1. Достаем звуки из базы (например, если text пустой — берем популярные)
+    # sounds = mif_core.get_sounds(text) 
+    
+    results = []
+    # Пример формирования списка для всплывающего окна
+    for sound in sounds:
+        results.append(
+            InlineQueryResultArticle(
+                id=str(sound['id']),
+                title=sound['title'],
+                input_message_content=InputTextMessageContent(
+                    message_text=f"🔊 {sound['title']}"
+                ),
+                description="Нажми, чтобы отправить звук"
+            )
+        )
+    
+    # 2. Отправляем результат в Telegram, чтобы вылезло окно над вводом
+    await inline_query.answer(results, cache_time=1, is_personal=True)
+    
 
 @dp.message(Command("start"), F.chat.type == "private")
 async def start_private_chat(message: Message, state: FSMContext) -> None:
