@@ -74,35 +74,6 @@ _START_TEXTS: dict[str, str] = {
     ),
 }
 
-from aiogram import Router
-from aiogram.types import InlineQuery, InlineQueryResultArticle, InputTextMessageContent
-
-router = Router()
-
-@router.inline_query()
-async def inline_search(inline_query: InlineQuery):
-    text = inline_query.query.strip()
-    
-    # 1. Достаем звуки из базы (например, если text пустой — берем популярные)
-    # sounds = mif_core.get_sounds(text) 
-    
-    results = []
-    # Пример формирования списка для всплывающего окна
-    for sound in sounds:
-        results.append(
-            InlineQueryResultArticle(
-                id=str(sound['id']),
-                title=sound['title'],
-                input_message_content=InputTextMessageContent(
-                    message_text=f"🔊 {sound['title']}"
-                ),
-                description="Нажми, чтобы отправить звук"
-            )
-        )
-    
-    # 2. Отправляем результат в Telegram, чтобы вылезло окно над вводом
-    await inline_query.answer(results, cache_time=1, is_personal=True)
-    
 
 @dp.message(Command("start"), F.chat.type == "private")
 async def start_private_chat(message: Message, state: FSMContext) -> None:
@@ -157,15 +128,40 @@ async def unmute_command(message: Message) -> None:
 
 @dp.message(Command("popular"), F.chat.type == "private")
 async def popular_command(message: Message) -> None:
-    top_sounds = db_manager.get_popular_sounds(limit=20)
+    top_sounds = db_manager.get_popular_sounds(limit=10)
     if not top_sounds:
         await message.answer("Рейтинг пока пуст.")
         return
-    lines = [
-        f"{i}. {mif.get('title', 'без названия')}"
-        for i, mif in enumerate(top_sounds, 1)
-    ]
-    await message.answer("🏆 Топ-20 звуков:\n\n" + "\n".join(lines))
+
+    keyboard_buttons = []
+    for mif in top_sounds:
+        mif_id = str(mif.get("id", ""))
+        title = str(mif.get("title", "Звук"))
+        keyboard_buttons.append([
+            InlineKeyboardButton(text=f"🔊 {title}", callback_data=f"play_{mif_id}")
+        ])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    await message.answer("🏆 <b>Топ популярных звуков:</b>", parse_mode="HTML", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("play_"))
+async def play_popular_sound(callback: CallbackQuery) -> None:
+    mif_id = callback.data.split("play_", 1)[-1]
+    mif = db_manager.get_mif_by_id(mif_id) if hasattr(db_manager, "get_mif_by_id") else None
+
+    if not mif:
+        await callback.answer("❌ Звук не найден в базе", show_alert=True)
+        return
+
+    file_id = mif.get("file_id")
+    file_type = mif.get("file_type", "voice")
+
+    await callback.answer()
+    if file_type == "audio":
+        await callback.message.answer_audio(audio=file_id, caption=mif.get("title"))
+    else:
+        await callback.message.answer_voice(voice=file_id, caption=mif.get("title"))
 
 
 @dp.message(Command("clear_history"), F.chat.type == "private")
@@ -178,8 +174,6 @@ async def clear_history_command(message: Message) -> None:
 
 # --- /help --------------------------------------------------------------------
 
-# ⚠️ НАПОМИНАЛКА: при добавлении/изменении команд — обновляй HELP_TEXT.
-# Только пользовательские команды. Админские (/loads и т.д.) — сюда не.
 HELP_TEXT = (
     "🔊 <b>MIFki</b>\n\n"
     "<code>@MIFki_bot запрос</code> — найти звук в любом чате\n\n"
@@ -226,7 +220,6 @@ async def show_info(message: Message) -> None:
 
 @dp.callback_query(F.data == "show_info")
 async def handle_info_button(callback: CallbackQuery) -> None:
-    # Отправляем новым сообщением, чтобы клавиатура /help оставалась видна
     await callback.message.answer(_build_info_text(), parse_mode="HTML")
     await callback.answer()
 
@@ -389,8 +382,6 @@ async def search_mifs(query: InlineQuery) -> None:
     query_text = query.query.strip()
 
     if not query_text:
-        # Пустой запрос — персональное меню: избранное + история (или глобальный
-        # топ для новых пользователей). Логика в db_manager.
         matches = db_manager.get_personal_menu(query.from_user.id)
         best_score = 100.0
     else:
@@ -421,17 +412,10 @@ async def search_mifs(query: InlineQuery) -> None:
 
     await query.answer(results=results, cache_time=1, is_personal=True)
 
-    # Локальный поиск дал слабое совпадение — планируем фоновый поиск на
-    # MyInstants/TikTok через debounce (не сразу: пока человек печатает,
-    # инлайн-событие прилетает на каждую букву). НЕ делаем это до
-    # query.answer(): инлайн-ответ должен приходить быстро.
     if query_text and best_score < mif_core.FUZZY_MATCH_THRESHOLD:
         mif_loader.schedule_background_lookup(query.bot, query.from_user.id, query_text)
 
 
-# Приходит только если в BotFather включена inline-обратная связь
-# (/setinlinefeedback → 100%) — без этого Telegram вообще не присылает
-# chosen_inline_result и record_usage никогда не вызовется.
 @dp.chosen_inline_result()
 async def track_chosen_result(chosen: ChosenInlineResult) -> None:
     db_manager.record_usage(chosen.from_user.id, chosen.result_id)
