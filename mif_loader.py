@@ -1,8 +1,19 @@
 """
-Автозагрузка звуков через универсальный движок yt-dlp: /loads, /loadsN, /loadsStop, /loadsSearch.
+Автозагрузка звуков с TikTok и MyInstants: /loads, /loadsN, /loadsStop, /loadsSearch.
 
-Логика вынесена сюда отдельно от main.py. Парсеры (import_myinstants, import_tiktok)
-используются исключительно для поиска ссылок и названий. Само скачивание делегировано yt-dlp.
+Для /loadsSearch и background_internet_lookup используется гонка трёх
+параллельных цепочек (поиск+скачивание). Побеждает первая вернувшая байты.
+
+Цепочки:
+  1. TikTok DDG → ssstik (локальный сервер)
+  2. MyInstants API → прямое скачивание (importer.download_audio)
+  3. MyInstants API → yt-dlp
+
+MI поиск выполняется ОДИН РАЗ и шарится между цепочками 2 и 3.
+Победитель конвертируется и публикуется. Проигравшие отменяются без следа.
+
+Для /loads (фоновый цикл по категориям) гонка не нужна — источник всегда
+MyInstants, используется import_one_sound напрямую.
 """
 
 from __future__ import annotations
@@ -23,7 +34,7 @@ from aiogram.types import Message
 
 import import_myinstants as importer
 import import_tiktok
-import mif_bugs   # FIX: report_bug живёт здесь, не в mif_core
+import mif_bugs   # report_bug живёт здесь, не в mif_core
 import mif_core
 
 logger = logging.getLogger("mif-bot.loader")
@@ -32,8 +43,12 @@ LOADS_ADMIN_ID = int(os.getenv("LOADS_ADMIN_ID", "1297417116"))
 LOADS_STEP_DELAY_SECONDS = 5.0
 
 LOADS_SEARCH_RE = re.compile(r'^/loadsSearch\s+"?([^"]+?)"?\s*$')
-LOADS_COUNT_RE = re.compile(r"^/loads(\d+)$")
+LOADS_COUNT_RE  = re.compile(r"^/loads(\d+)$")
 
+
+# ---------------------------------------------------------------------------
+# Состояние /loads цикла и debounce для background_internet_lookup
+# ---------------------------------------------------------------------------
 
 class LoaderState:
     def __init__(self) -> None:
@@ -58,36 +73,26 @@ class _UserLookupState:
 _user_lookup_states: dict[int, _UserLookupState] = {}
 
 
-def is_valid_audio_bytes(data: bytes) -> bool:
-    """Проверяет байты на реальные сигнатуры аудио/видео форматов."""
-    if len(data) < 5000:
-        return False
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
 
-    head = data[:1000].lower()
-    if b"<html" in head or b"<!doctype" in head or b"<head" in head or b'{"error"' in head or b"<script" in head:
-        return False
-
-    is_mp3  = data.startswith(b"ID3") or data.startswith(b"\xff\xfb") or data.startswith(b"\xff\xf3")
-    is_ogg  = data.startswith(b"OggS")
-    is_wav  = data.startswith(b"RIFF") and b"WAVE" in data[:16]
-    is_flac = data.startswith(b"fLaC")
-    is_mp4  = len(data) > 8 and data[4:8] == b"ftyp"
-    is_webm = data.startswith(b"\x1a\x45\xdf\xa3")
-
-    return is_mp3 or is_ogg or is_wav or is_flac or is_mp4 or is_webm
+def _mi_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(importer.MYINSTANTS_HEADERS)
+    return s
 
 
 def schedule_background_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
     state = _user_lookup_states.setdefault(requester_id, _UserLookupState())
-
     if state.in_flight:
         state.latest_pending_query = query_text
         return
-
     if state.debounce_task is not None and not state.debounce_task.done():
         state.debounce_task.cancel()
-
-    state.debounce_task = asyncio.create_task(_debounced_lookup(bot, requester_id, query_text))
+    state.debounce_task = asyncio.create_task(
+        _debounced_lookup(bot, requester_id, query_text)
+    )
 
 
 async def _debounced_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
@@ -110,75 +115,191 @@ async def _debounced_lookup(bot: Bot, requester_id: int, query_text: str) -> Non
         schedule_background_lookup(bot, requester_id, next_query)
 
 
-async def _download_audio_ytdlp(url: str) -> bytes:
-    """Универсальная загрузка аудио через yt-dlp. Возвращает сырые байты скачанного файла."""
-    def _extract():
+async def _download_via_ytdlp(url: str) -> bytes:
+    """Скачивает через yt-dlp (резерв когда прямой HTTP заблокирован)."""
+    def _run() -> bytes:
         with tempfile.TemporaryDirectory() as tmpdir:
-            ydl_opts = {
+            opts = {
                 "format": "bestaudio/best",
                 "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
                 "quiet": True,
                 "no_warnings": True,
             }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
                 files = os.listdir(tmpdir)
                 if not files:
-                    raise RuntimeError("yt-dlp не смог извлечь аудио файл")
+                    raise RuntimeError("yt-dlp не извлёк файл")
                 with open(os.path.join(tmpdir, files[0]), "rb") as f:
                     return f.read()
 
-    return await asyncio.to_thread(_extract)
+    return await asyncio.to_thread(_run)
 
 
-async def import_one_sound(
+# ---------------------------------------------------------------------------
+# Гонка трёх источников (core логика /loadsSearch и background_lookup)
+# ---------------------------------------------------------------------------
+
+async def _race_all_sources(
+    query: str,
+    *,
+    timeout: float = 45.0,
+) -> tuple[bytes, dict[str, str]] | None:
+    """
+    Запускает три параллельные цепочки (поиск + скачивание).
+    Возвращает (audio_bytes, sound_info) первой успешной цепочки.
+    Остальные отменяются немедленно после победителя.
+
+    Цепочки:
+      1. TikTok DDG → ssstik (локальный FastAPI)
+      2. MyInstants API → прямое скачивание
+      3. MyInstants API → yt-dlp
+    MI поиск выполняется один раз, результат шарится между 2 и 3.
+    """
+    # --- Общий кэш MI поиска ---
+    mi_result: list[tuple[float, dict]] = []
+    mi_done = asyncio.Event()
+
+    async def do_mi_search() -> None:
+        try:
+            cands = await importer.search_catalog(
+                _mi_session(), query,
+                min_score=mif_core.FUZZY_MATCH_FLOOR, max_results=1,
+            )
+            mi_result.extend(cands)
+        except Exception:
+            pass
+        finally:
+            mi_done.set()
+
+    # --- Победный слот (атомарен в asyncio — нет await внутри try_claim) ---
+    won = asyncio.Event()
+    winner: list[tuple[bytes, dict]] = []
+
+    def try_claim(audio: bytes, sound: dict) -> bool:
+        if won.is_set():
+            return False
+        won.set()
+        winner.append((audio, sound))
+        return True
+
+    # --- Цепочка 1: TikTok ---
+    async def pipeline_tiktok() -> None:
+        try:
+            cands = await asyncio.wait_for(
+                import_tiktok.search_catalog(
+                    requests.Session(), query,
+                    min_score=mif_core.FUZZY_MATCH_FLOOR, max_results=1,
+                ),
+                timeout=8.0,
+            )
+            if not cands or won.is_set():
+                return
+            _, sound = cands[0]
+            sound = {**sound, "source_type": "tiktok"}
+            logger.debug("race: TikTok нашёл «%s», запускаю ssstik", sound["title"])
+            audio = await asyncio.to_thread(
+                import_tiktok.download_audio, requests.Session(), sound["url"]
+            )
+            if try_claim(audio, sound):
+                logger.debug("race: TikTok ПОБЕДИЛ «%s»", sound["title"])
+        except Exception as e:
+            logger.debug("race: TikTok pipeline упал: %s", e)
+
+    # --- Цепочка 2: MyInstants прямое скачивание ---
+    async def pipeline_mi_direct() -> None:
+        await mi_done.wait()
+        if not mi_result or won.is_set():
+            return
+        try:
+            _, sound = mi_result[0]
+            sound = {**sound, "source_type": "myinstants"}
+            logger.debug("race: MI прямое → «%s»", sound["title"])
+            audio = await asyncio.to_thread(importer.download_audio, _mi_session(), sound["url"])
+            if try_claim(audio, sound):
+                logger.debug("race: MI прямое ПОБЕДИЛО «%s»", sound["title"])
+        except importer.AudioTooLargeError:
+            logger.debug("race: MI прямое: файл >20 МБ")
+        except Exception as e:
+            logger.debug("race: MI прямое упало: %s", e)
+
+    # --- Цепочка 3: MyInstants + yt-dlp ---
+    async def pipeline_mi_ytdlp() -> None:
+        await mi_done.wait()
+        if not mi_result or won.is_set():
+            return
+        try:
+            _, sound = mi_result[0]
+            sound = {**sound, "source_type": "myinstants"}
+            logger.debug("race: yt-dlp → «%s»", sound["title"])
+            audio = await _download_via_ytdlp(sound["url"])
+            if try_claim(audio, sound):
+                logger.debug("race: yt-dlp ПОБЕДИЛ «%s»", sound["title"])
+        except Exception as e:
+            logger.debug("race: yt-dlp упал: %s", e)
+
+    # --- Запуск ---
+    mi_task = asyncio.create_task(do_mi_search())
+    pipe_tasks = [
+        asyncio.create_task(pipeline_tiktok()),
+        asyncio.create_task(pipeline_mi_direct()),
+        asyncio.create_task(pipeline_mi_ytdlp()),
+    ]
+
+    # Ждём первого победителя ИЛИ пока все не завершатся
+    remaining: set[asyncio.Task] = set(pipe_tasks)
+    deadline = asyncio.get_running_loop().time() + timeout
+
+    while remaining and not won.is_set():
+        time_left = deadline - asyncio.get_running_loop().time()
+        if time_left <= 0:
+            break
+        done, remaining = await asyncio.wait(
+            remaining,
+            timeout=time_left,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+    # Отменяем всё лишнее
+    mi_task.cancel()
+    for t in pipe_tasks:
+        t.cancel()
+    await asyncio.gather(mi_task, *pipe_tasks, return_exceptions=True)
+
+    return winner[0] if winner else None
+
+
+# ---------------------------------------------------------------------------
+# Конвертация + публикация (общая для loadsSearch и background_lookup)
+# ---------------------------------------------------------------------------
+
+async def _convert_and_publish(
     bot: Bot,
+    audio_bytes: bytes,
     sound: dict[str, str],
-    notify_func=None,
 ) -> tuple[str, dict[str, Any] | None]:
-    """Скачивает, обрабатывает и публикует звук с уведомлением пользователя на каждом шаге."""
-    title = sound["title"]
+    """
+    Принимает сырые байты победителя гонки, конвертирует и публикует.
+    Возвращает ('added' | 'duplicate' | 'error', запись_или_None).
+    """
+    title = sound.get("title", "")
     source_type = sound.get("source_type", "myinstants")
     source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
-
-    try:
-        if source_type == "tiktok":
-            if notify_func:
-                await notify_func("📥 [Шаг 2/3] Запускаю парсинг <b>ssstik.io</b> и скачивание MP3 из TikTok...")
-            session = requests.Session()
-            audio_bytes = await asyncio.to_thread(import_tiktok.download_audio, session, sound["url"])
-        else:
-            if notify_func:
-                await notify_func("📥 [Шаг 2/3] Скачиваю аудиофайл с MyInstants через <b>yt-dlp</b>...")
-            audio_bytes = await _download_audio_ytdlp(sound["url"])
-
-    except yt_dlp.utils.DownloadError as error:
-        await mif_bugs.report_bug(bot, f"Автозагрузка ({source_label}): yt-dlp не смог скачать «{title}»: {error}")
-        return "error", None
-    except import_tiktok.NotAudioContentError as error:
-        await mif_bugs.report_bug(bot, f"Автозагрузка (TikTok): ssstik отдал не аудио «{title}»: {error}")
-        return "error", None
-    except Exception as error:
-        await mif_bugs.report_bug(bot, f"Автозагрузка ({source_label}): ошибка скачивания «{title}»: {error}")
-        return "error", None
-
-    if notify_func:
-        await notify_func("⚙️ [Шаг 3/3] Обрабатываю звук: конвертация в Voice OGG + распознавание речи...")
 
     try:
         bot_text, transcription_error, ogg_bytes, content_hash = (
             await mif_core.prepare_audio_from_bytes(audio_bytes)
         )
     except RuntimeError as error:
-        await mif_bugs.report_bug(bot, f"Автозагрузка ({source_label}): ошибка конвертации «{title}»: {error}")
+        await mif_bugs.report_bug(bot, f"race: конвертация не удалась для «{title}»: {error}")
         return "error", None
 
-    displayed_bot_text = bot_text or "Речь не распознана."
+    displayed = bot_text or "Речь не распознана."
     base_caption = (
         f"<b>MIF с {source_label} (автозагрузка)</b>\n\n"
-        f"<b>Название и теги:</b> {html.escape(mif_core.clip_text(title))}\n"
-        f"<b>Авто-описание:</b> {html.escape(mif_core.clip_text(displayed_bot_text))}\n"
-        f"<b>Источник:</b> {html.escape(sound['url'])}"
+        f"<b>Название:</b> {html.escape(mif_core.clip_text(title))}\n"
+        f"<b>Авто-описание:</b> {html.escape(mif_core.clip_text(displayed))}\n"
+        f"<b>Источник:</b> {html.escape(sound.get('url', ''))}"
     )
 
     try:
@@ -191,10 +312,10 @@ async def import_one_sound(
             tags_text=title,
             bot_description=bot_text,
             content_hash=content_hash,
-            source_url=sound["url"],
+            source_url=sound.get("url", ""),
         )
     except TelegramAPIError as error:
-        await mif_bugs.report_bug(bot, f"Автозагрузка ({source_label}): Telegram отклонил «{title}»: {error}")
+        await mif_bugs.report_bug(bot, f"race: Telegram отклонил «{title}»: {error}")
         return "error", None
 
     if status == "added" and transcription_error:
@@ -203,9 +324,56 @@ async def import_one_sound(
     return status, new_mif
 
 
+# ---------------------------------------------------------------------------
+# import_one_sound — используется только в /loads цикле (MyInstants batch)
+# ---------------------------------------------------------------------------
+
+async def import_one_sound(
+    bot: Bot,
+    session: requests.Session,
+    sound: dict[str, str],
+    notify_func=None,
+) -> tuple[str, dict[str, Any] | None]:
+    """
+    Для /loads цикла: источник уже известен (всегда MyInstants).
+    Прямое скачивание → yt-dlp как резерв.
+    """
+    title = sound["title"]
+
+    if notify_func:
+        await notify_func("📥 Скачиваю с MyInstants...")
+
+    try:
+        audio_bytes = await asyncio.to_thread(importer.download_audio, session, sound["url"])
+    except importer.AudioTooLargeError:
+        logger.info("Пропущен (>20 МБ): %s", title)
+        return "error", None
+    except Exception as direct_err:
+        logger.info("Прямое скачивание не вышло (%s) → yt-dlp: %s", type(direct_err).__name__, title)
+        if notify_func:
+            await notify_func("📥 Cloudflare блок → пробую yt-dlp...")
+        try:
+            audio_bytes = await _download_via_ytdlp(sound["url"])
+        except Exception as ytdlp_err:
+            await mif_bugs.report_bug(
+                bot,
+                f"Автозагрузка (MyInstants): оба метода не сработали для «{title}»\n"
+                f"  прямое: {direct_err}\n  yt-dlp: {ytdlp_err}",
+            )
+            return "error", None
+
+    if notify_func:
+        await notify_func("⚙️ Конвертирую в Voice OGG + распознаю речь...")
+
+    return await _convert_and_publish(bot, audio_bytes, {**sound, "source_type": "myinstants"})
+
+
+# ---------------------------------------------------------------------------
+# /loads — фоновый цикл по категориям MyInstants
+# ---------------------------------------------------------------------------
+
 async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> None:
-    session = requests.Session()
-    session.headers.update(importer.MYINSTANTS_HEADERS)
+    session = _mi_session()
     pager = importer.CatalogPager()
 
     try:
@@ -217,6 +385,16 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
             try:
                 page_html = await asyncio.to_thread(importer.fetch_page, session, page_url)
                 sounds = importer.parse_page(page_html)
+            except requests.HTTPError as error:
+                code = error.response.status_code if error.response is not None else None
+                if code not in {404, 410}:
+                    await mif_bugs.report_bug(
+                        bot,
+                        f"Автозагрузка: «{pager.current_category}» не загрузилась: {error}",
+                    )
+                pager.advance_category()
+                await asyncio.sleep(LOADS_STEP_DELAY_SECONDS)
+                continue
             except requests.RequestException as error:
                 await mif_bugs.report_bug(bot, f"Автозагрузка: ошибка загрузки категории: {error}")
                 pager.advance_category()
@@ -233,14 +411,13 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
                     target_count is not None and loader_state.added_count >= target_count
                 ):
                     break
-
                 if mif_core.find_duplicate_by_title(sound["title"]) is not None:
                     await asyncio.sleep(LOADS_STEP_DELAY_SECONDS)
                     continue
 
                 sound["source_type"] = "myinstants"
                 try:
-                    status, _ = await import_one_sound(bot, sound)
+                    status, _ = await import_one_sound(bot, session, sound)
                 except Exception:
                     logger.exception("Автозагрузка: критическая ошибка на «%s»", sound["title"])
                     status = "error"
@@ -275,7 +452,7 @@ async def handle_loads_start(message: Message, target_count: int | None) -> None
     )
 
     if target_count:
-        await message.answer(f"▶️ Запуск (цель: {target_count}). Досрочная остановка — /loadsStop.")
+        await message.answer(f"▶️ Запуск (цель: {target_count}). Остановка — /loadsStop.")
     else:
         await message.answer("▶️ Запуск (бесконечно). Остановка — /loadsStop.")
 
@@ -286,8 +463,12 @@ async def handle_loads_stop(message: Message) -> None:
         return
 
     loader_state.stop_event.set()
-    await message.answer(f"⏸ Останавливаю (доработаю текущую паузу {LOADS_STEP_DELAY_SECONDS:.0f} сек).")
+    await message.answer(f"⏸ Останавливаю (доработаю паузу {LOADS_STEP_DELAY_SECONDS:.0f} сек).")
 
+
+# ---------------------------------------------------------------------------
+# /loadsSearch — ручной поиск с гонкой трёх источников
+# ---------------------------------------------------------------------------
 
 async def handle_loads_search(message: Message, query: str) -> None:
     if not query:
@@ -295,99 +476,68 @@ async def handle_loads_search(message: Message, query: str) -> None:
         return
 
     status_msg = await message.answer(
-        "🔍 <b>[Шаг 1/3]</b> Запускаю параллельный поиск:\n"
-        "• 🎬 <b>TikTok</b> (таймаут 2.0 сек)\n"
-        "• 🎵 <b>MyInstants</b>...",
+        "🏁 <b>Гонка трёх источников:</b>\n"
+        "• 🎬 TikTok (DDG → ssstik)\n"
+        "• 🎵 MyInstants (прямое скачивание)\n"
+        "• 🔧 MyInstants (yt-dlp)\n\n"
+        "Параллельно ищу и скачиваю — победит самый быстрый...",
         parse_mode="HTML",
     )
 
-    async def update_status(text: str) -> None:
+    async def upd(text: str) -> None:
         try:
             await status_msg.edit_text(text, parse_mode="HTML")
         except Exception:
             pass
 
-    session = requests.Session()
-    session.headers.update(importer.MYINSTANTS_HEADERS)
-    start_time = asyncio.get_running_loop().time()
+    result = await _race_all_sources(query)
 
-    async def fetch_tiktok():
-        try:
-            return await asyncio.wait_for(
-                import_tiktok.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR),
-                timeout=2.0,
-            )
-        except asyncio.TimeoutError:
-            return "TIMEOUT"
-        except Exception:
-            return []
-
-    async def fetch_mi():
-        try:
-            return await importer.search_catalog(session, query, min_score=mif_core.FUZZY_MATCH_FLOOR)
-        except Exception:
-            return []
-
-    tt_res, mi_res = await asyncio.gather(fetch_tiktok(), fetch_mi())
-
-    candidates = []
-    source_type = ""
-
-    if isinstance(tt_res, list) and tt_res:
-        candidates = tt_res
-        source_type = "tiktok"
-        elapsed = round(asyncio.get_running_loop().time() - start_time, 2)
-        await update_status(
-            f"⚡ <b>Развилка: Выбран TikTok!</b>\n"
-            f"⏱ Ответ за {elapsed} сек.\n"
-            f"📌 Найдено: «<i>{candidates[0][1]['title']}</i>»\n\n"
-            "Перехожу к скачиванию..."
-        )
-    elif mi_res:
-        candidates = mi_res
-        source_type = "myinstants"
-        reason = "⏱ TikTok не успел за 2 сек" if tt_res == "TIMEOUT" else "❌ В TikTok ничего не найдено"
-        await update_status(
-            f"⏳ <b>Развилка: Выбран MyInstants!</b>\n"
-            f"Причина: {reason}.\n"
-            f"📌 Найдено: «<i>{candidates[0][1]['title']}</i>»\n\n"
-            "Перехожу к скачиванию..."
-        )
-    else:
-        await update_status("❌ <b>Ничего не найдено</b> ни в TikTok, ни в MyInstants.")
+    if result is None:
+        await upd("❌ <b>Все источники не нашли ничего.</b>\nПопробуй другой запрос.")
         return
 
-    best_score, sound = candidates[0]
-    sound["source_type"] = source_type
+    audio_bytes, sound = result
+    title = sound.get("title", query)
+    source_type = sound.get("source_type", "myinstants")
+    source_label = "TikTok (ssstik)" if source_type == "tiktok" else "MyInstants"
 
-    existing_by_title = mif_core.find_duplicate_by_title(sound["title"])
-    if existing_by_title:
-        await update_status(f"⚠️ <b>Дубликат!</b> Звук «{sound['title']}» уже сохранён в базе.")
-        await message.answer_voice(voice=existing_by_title["file_id"])
+    # Проверка дубликата по названию
+    existing = mif_core.find_duplicate_by_title(title)
+    if existing:
+        await upd(f"⚠️ <b>Дубликат!</b> «{title}» уже в базе.")
+        await message.answer_voice(voice=existing["file_id"])
         return
 
-    status, entry = await import_one_sound(message.bot, sound, notify_func=update_status)
+    await upd(
+        f"⚡ <b>{source_label} выиграл!</b>\n"
+        f"«{title}» → конвертирую и публикую..."
+    )
+
+    status, entry = await _convert_and_publish(message.bot, audio_bytes, sound)
 
     if status == "duplicate" and entry:
-        await update_status(f"⚠️ <b>Дубликат по аудио-хэшу!</b> Совпадает с «{entry.get('title')}».")
+        await upd(f"⚠️ <b>Дубликат по хэшу!</b> Совпадает с «{entry.get('title')}».")
         await message.answer_voice(voice=entry["file_id"])
         return
 
     if status == "added" and entry:
-        source_label = "TikTok (ssstik.io)" if source_type == "tiktok" else "MyInstants (yt-dlp)"
-        await update_status(
-            f"✅ <b>Звук успешно добавлен!</b>\n\n"
-            f"<b>Источник:</b> {source_label}\n"
-            f"<b>Название:</b> {entry['title']}"
+        await upd(
+            f"✅ <b>Добавлен!</b>\n"
+            f"Источник: {source_label}\n"
+            f"Название: {entry['title']}"
         )
         return
 
-    await update_status("⚠️ Ошибка на этапе скачивания или обработки файла.")
+    await upd("⚠️ Ошибка публикации.")
 
+
+# ---------------------------------------------------------------------------
+# Фоновый поиск (после слабого инлайн-совпадения) — тоже гонка трёх
+# ---------------------------------------------------------------------------
 
 async def background_internet_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
-    """Фоновый поиск: запускается после слабого совпадения в инлайн-поиске.
-    Один статусный messages редактируется по мере прогресса — не спамим.
+    """Инлайн-поиск дал слабый результат — пробуем найти в фоне.
+    Один статусный messages, редактируется. Те же 3 параллельные цепочки.
     """
     muted = mif_core.is_muted(requester_id)
     can_message = True
@@ -397,8 +547,8 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
         try:
             status_msg = await bot.send_message(
                 requester_id,
-                f"🔍 <b>Автопоиск в интернете:</b> «{query_text}»\n"
-                "Параллельно опрашиваю TikTok (2с) и MyInstants...",
+                f"🔍 <b>Автопоиск:</b> «{query_text}»\n"
+                "TikTok · MyInstants · yt-dlp — параллельно...",
                 parse_mode="HTML",
             )
         except TelegramAPIError:
@@ -411,75 +561,34 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
             except TelegramAPIError:
                 pass
 
-    session = requests.Session()
-    session.headers.update(importer.MYINSTANTS_HEADERS)
-    start_time = asyncio.get_running_loop().time()
+    result = await _race_all_sources(query_text)
 
-    async def fetch_tiktok():
-        try:
-            return await asyncio.wait_for(
-                import_tiktok.search_catalog(
-                    session, query_text,
-                    max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD,
-                ),
-                timeout=2.0,
-            )
-        except asyncio.TimeoutError:
-            return "TIMEOUT"
-        except Exception:
-            return []
-
-    async def fetch_mi():
-        try:
-            return await importer.search_catalog(
-                session, query_text,
-                max_results=1, min_score=mif_core.FUZZY_MATCH_THRESHOLD,
-                fast_only=True,
-            )
-        except Exception:
-            return []
-
-    tt_res, mi_res = await asyncio.gather(fetch_tiktok(), fetch_mi())
-
-    candidates = []
-    source_type = ""
-
-    if isinstance(tt_res, list) and tt_res:
-        candidates = tt_res
-        source_type = "tiktok"
-        elapsed = round(asyncio.get_running_loop().time() - start_time, 2)
-        await notify(
-            f"⚡ <b>TikTok успел за {elapsed}с!</b>\n"
-            f"Нашёл: «{candidates[0][1]['title']}»\n"
-            "Запускаю ssstik.io..."
-        )
-    elif mi_res:
-        candidates = mi_res
-        source_type = "myinstants"
-        reason = "⏱ TikTok превысил 2 сек" if tt_res == "TIMEOUT" else "TikTok не нашёл совпадений"
-        await notify(
-            f"⏳ <b>{reason}.</b>\n"
-            f"Беру MyInstants: «{candidates[0][1]['title']}»\n"
-            "Запускаю yt-dlp..."
-        )
-    else:
-        await notify(f"⚠️ Не нашёл «{query_text}» ни в TikTok, ни в MyInstants.")
+    if result is None:
+        await notify(f"⚠️ Не нашёл «{query_text}» нигде.")
         return
 
-    _, sound = candidates[0]
-    sound["source_type"] = source_type
+    audio_bytes, sound = result
+    title = sound.get("title", query_text)
+    source_type = sound.get("source_type", "myinstants")
+    source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
 
-    if mif_core.find_duplicate_by_title(sound["title"]):
-        await notify("✅ Звук с таким названием уже есть в базе.")
+    await notify(f"⚡ <b>{source_label} выиграл!</b>\n«{title}» → публикую...")
+
+    if mif_core.find_duplicate_by_title(title):
+        await notify("✅ Уже есть в базе.")
         return
 
-    try:
-        status, entry = await import_one_sound(bot, sound, notify_func=notify)
-        if status in ("added", "duplicate") and entry:
-            await notify(f"✅ <b>Готово!</b> Звук «{entry['title']}» добавлен.")
-    except Exception:
-        await notify("⚠️ Ошибка при обработке звука.")
+    status, entry = await _convert_and_publish(bot, audio_bytes, sound)
 
+    if status in ("added", "duplicate") and entry:
+        await notify(f"✅ <b>Готово!</b> «{entry['title']}» добавлен.")
+    elif status == "error":
+        await notify("⚠️ Ошибка при конвертации или публикации.")
+
+
+# ---------------------------------------------------------------------------
+# Диспетчер /loads* команд
+# ---------------------------------------------------------------------------
 
 async def handle_loads_commands(message: Message) -> None:
     text = (message.text or "").strip()
@@ -505,5 +614,11 @@ async def handle_loads_commands(message: Message) -> None:
         await handle_loads_start(message, target_count=int(count_match.group(1)))
         return
 
-    await message.answer('Не понял команду. Доступно: /loads, /loads5, /loadsStop, /loadsSearch "запрос"')
+    await message.answer(
+        "Не понял. Доступно:\n"
+        "/loads — бесконечная автозагрузка\n"
+        "/loads5 — загрузить 5 новых MIFов\n"
+        "/loadsStop — остановить\n"
+        '/loadsSearch "запрос" — найти и загрузить звук'
+    )
     
