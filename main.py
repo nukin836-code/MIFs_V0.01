@@ -124,7 +124,8 @@ async def mute_command(message: Message) -> None:
         return
     mif_core.mute_user(message.from_user.id)
     await message.answer("🔕 Уведомления отключены. Включить — /unmute.")
-    @dp.message(Command("unmute"), F.chat.type == "private")
+
+@dp.message(Command("unmute"), F.chat.type == "private")
 async def unmute_command(message: Message) -> None:
     if message.from_user is None:
         return
