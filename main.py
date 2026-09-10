@@ -1,9 +1,6 @@
 """
-Точка входа бота. Здесь только Telegram-хендлеры (регистрация команд, FSM,
-инлайн-поиск) и запуск polling'а. Вся реальная логика — в mif_core.py
-(обработка аудио, база, публикация) и mif_loader.py (автозагрузка с
-MyInstants). Если тебе нужно поменять ЧТО происходит при публикации/хэшах —
-правь mif_core.py, а не этот файл.
+Точка входа бота. Только Telegram-хендлеры (команды, FSM, инлайн-поиск).
+Вся базовая логика — в mif_core.py, работа с базами пользователей и рейтинга — в db_manager.py.
 """
 
 import asyncio
@@ -128,7 +125,7 @@ async def unmute_command(message: Message) -> None:
 
 @dp.message(Command("popular"), F.chat.type == "private")
 async def popular_command(message: Message) -> None:
-    top_sounds = db_manager.get_popular_sounds(limit=10)
+    top_sounds = db_manager.get_popular_sounds(limit=20)
     if not top_sounds:
         await message.answer("Рейтинг пока пуст.")
         return
@@ -136,26 +133,27 @@ async def popular_command(message: Message) -> None:
     keyboard_buttons = []
     for mif in top_sounds:
         mif_id = str(mif.get("id", ""))
-        title = str(mif.get("title", "Звук"))
+        title = str(mif.get("title", mif.get("user_description", "Звук")))
         keyboard_buttons.append([
-            InlineKeyboardButton(text=f"🔊 {title}", callback_data=f"play_{mif_id}")
+            InlineKeyboardButton(text=f"🔊 {title[:32]}", callback_data=f"play_{mif_id}")
         ])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer("🏆 <b>Топ популярных звуков:</b>", parse_mode="HTML", reply_markup=keyboard)
+    await message.answer("🏆 <b>Топ-20 популярных звуков:</b>", parse_mode="HTML", reply_markup=keyboard)
 
 
 @dp.callback_query(F.data.startswith("play_"))
 async def play_popular_sound(callback: CallbackQuery) -> None:
     mif_id = callback.data.split("play_", 1)[-1]
-    mif = db_manager.get_mif_by_id(mif_id) if hasattr(db_manager, "get_mif_by_id") else None
+    # Используем правильную функцию вызова из mif_core:
+    mif = mif_core.get_mif_by_id(mif_id)
 
     if not mif:
         await callback.answer("❌ Звук не найден в базе", show_alert=True)
         return
 
     file_id = mif.get("file_id")
-    file_type = mif.get("file_type", "voice")
+    file_type = mif.get("file_type", mif.get("media_type", "voice"))
 
     await callback.answer()
     if file_type == "audio":
@@ -337,7 +335,7 @@ async def handle_description(message: Message, state: FSMContext) -> None:
         duplicate_title = new_mif.get("title") or "без названия"
         await message.answer(
             f"⚠️ Такой звук уже есть в базе: «{duplicate_title}».\n"
-            "Обрежь или измени файл, если думаешь, что это ошибка."
+            "Ообрежь или измени файл, если думаешь, что это ошибка."
         )
         return
 
@@ -382,6 +380,7 @@ async def search_mifs(query: InlineQuery) -> None:
     query_text = query.query.strip()
 
     if not query_text:
+        # Пустой запрос: отдаем личное меню из db_manager (избранное + история или топ)
         matches = db_manager.get_personal_menu(query.from_user.id)
         best_score = 100.0
     else:
