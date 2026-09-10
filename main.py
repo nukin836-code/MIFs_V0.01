@@ -1,6 +1,8 @@
 """
 Точка входа бота. Только Telegram-хендлеры (команды, FSM, инлайн-поиск).
 Вся базовая логика — в mif_core.py, работа с базами пользователей и рейтинга — в db_manager.py.
+Mini App (веб-витрина звуков канала) — в webapp_api.py, здесь только команда
+для её открытия и настройка кнопки меню бота.
 """
 
 import asyncio
@@ -22,7 +24,9 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultCachedAudio,
     InlineQueryResultCachedVoice,
+    MenuButtonWebApp,
     Message,
+    WebAppInfo,
 )
 
 import mif_core
@@ -32,6 +36,12 @@ import db_manager
 logger = logging.getLogger("mif-bot")
 
 MAX_DESCRIPTION_LENGTH = 700
+
+# URL Mini App (веб-витрины звуков). Задаётся в .env/переменных окружения —
+# см. webapp_api.py и start_miniapp.sh. Пока не задан — команда /app и
+# кнопка меню просто молчат вместо падения, чтобы бот работал и без
+# развёрнутого Mini App backend'а.
+MINIAPP_URL = os.getenv("MINIAPP_URL", "").strip()
 
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -55,18 +65,21 @@ _START_TEXTS: dict[str, str] = {
         "🔊 <b>MIFki Bot</b>\n\n"
         "Ищи звуки через инлайн: <code>@MIFki_bot запрос</code>\n"
         "Добавь свой — пришли аудиофайл в этот чат.\n\n"
+        "/app — открыть все звуки в приложении\n"
         "/help — все команды"
     ),
     "en": (
         "🔊 <b>MIFki Bot</b>\n\n"
         "Search sounds via inline: <code>@MIFki_bot query</code>\n"
         "Add your own — send an audio file here.\n\n"
+        "/app — open all sounds in the app\n"
         "/help — all commands"
     ),
     "ua": (
         "🔊 <b>MIFki Bot</b>\n\n"
         "Шукай звуки через інлайн: <code>@MIFki_bot запит</code>\n"
         "Додай свій — надішли аудіофайл у цей чат.\n\n"
+        "/app — відкрити всі звуки в застосунку\n"
         "/help — всі команди"
     ),
 }
@@ -111,9 +124,7 @@ async def mute_command(message: Message) -> None:
         return
     mif_core.mute_user(message.from_user.id)
     await message.answer("🔕 Уведомления отключены. Включить — /unmute.")
-
-
-@dp.message(Command("unmute"), F.chat.type == "private")
+    @dp.message(Command("unmute"), F.chat.type == "private")
 async def unmute_command(message: Message) -> None:
     if message.from_user is None:
         return
@@ -170,11 +181,34 @@ async def clear_history_command(message: Message) -> None:
     await message.answer("🗑 История очищена. Избранное не тронуто.")
 
 
+# --- /app — открыть Mini App ---------------------------------------------------
+
+@dp.message(Command("app"), F.chat.type == "private")
+async def open_miniapp(message: Message) -> None:
+    if not MINIAPP_URL:
+        await message.answer(
+            "⚠️ Приложение сейчас не настроено (не задан MINIAPP_URL). "
+            "Спроси администратора бота."
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🔊 Открыть MIFki", web_app=WebAppInfo(url=MINIAPP_URL))
+        ]]
+    )
+    await message.answer(
+        "Все звуки из @MIFFFKI в одном приложении — ищи, слушай, отправляй в чат.",
+        reply_markup=keyboard,
+    )
+
+
 # --- /help --------------------------------------------------------------------
 
 HELP_TEXT = (
     "🔊 <b>MIFki</b>\n\n"
     "<code>@MIFki_bot запрос</code> — найти звук в любом чате\n\n"
+    "/app — открыть все звуки в приложении\n"
     "/popular — топ-20 популярных звуков\n"
     "/clear_history — очистить свою историю\n"
     "/mute · /unmute — уведомления об автопоиске\n"
@@ -196,7 +230,6 @@ async def show_help(message: Message) -> None:
 
 
 # --- /info --------------------------------------------------------------------
-
 def _build_info_text() -> str:
     count = len(mif_core.MIFS_DATABASE)
     return (
@@ -309,7 +342,6 @@ async def handle_description(message: Message, state: FSMContext) -> None:
         f"{html.escape(mif_core.clip_text(displayed_bot_description))}\n"
         f"<b>Добавил:</b> {html.escape(author_name)}"
     )
-
     try:
         status, new_mif = await mif_core.publish_voice_mif(
             message.bot,
@@ -429,14 +461,27 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
-
     async with Bot(token=bot_token) as bot:
         bot_info = await bot.get_me()
         logger.info("MIF bot started as @%s", bot_info.username)
         logger.info("Publishing new MIFs to %s", mif_core.CHANNEL_ID)
+
+        if MINIAPP_URL:
+            try:
+                await bot.set_chat_menu_button(
+                    menu_button=MenuButtonWebApp(text="🔊 MIFki", web_app=WebAppInfo(url=MINIAPP_URL))
+                )
+                logger.info("Кнопка меню настроена на Mini App: %s", MINIAPP_URL)
+            except TelegramAPIError:
+                # Не фатально — /app как команда всё ещё работает, даже если
+                # кнопку меню почему-то не удалось выставить (например, URL
+                # ещё не HTTPS в момент рестарта туннеля).
+                logger.exception("Не удалось выставить кнопку меню на Mini App")
+        else:
+            logger.info("MINIAPP_URL не задан — кнопка меню Mini App не настроена, доступна только /app")
+
         await dp.start_polling(bot)
 
 
-if __name__ == "__main__":
+if name == "main":
     asyncio.run(main())
-    

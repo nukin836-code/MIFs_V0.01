@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MIFki</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  /* ---- Токены темы. Значения по умолчанию — на случай, если страницу
+     открыли не из Telegram (например, при разработке в обычном браузере).
+     Внутри Telegram они тут же перезаписываются из tg.themeParams, чтобы
+     приложение всегда выглядело "родным" для текущей темы клиента. */
+  :root{
+    --bg:#14110D;
+    --panel:#1E1A15;
+    --text:#F3EFE8;
+    --hint:#9C9086;
+    --divider:rgba(255,255,255,.08);
+    --accent:#FFB238;
+    --accent-text:#14110D;
+    --hot:#FF5D5D;
+    --radius:16px;
+    --font-display:'Space Grotesk', system-ui, sans-serif;
+    --font-body:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--font-body);
+    -webkit-tap-highlight-color:transparent;
+    overscroll-behavior-y:none;
+  }
+
+  .app{
+    max-width:560px;
+    margin:0 auto;
+    min-height:100dvh;
+    padding:14px 14px 96px;
+  }
+
+  /* ---- Шапка: waveform-логотип вместо иконки, как визуальный лейтмотив
+     всего приложения (голосовые сообщения Telegram и есть "полоски"). */
+  .topbar{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:4px 2px 14px;
+  }
+  .brand{display:flex;align-items:center;gap:10px;}
+  .brand-name{
+    font-family:var(--font-display);
+    font-weight:700;
+    font-size:20px;
+    letter-spacing:.2px;
+  }
+  .channel-link{
+    color:var(--hint);
+    text-decoration:none;
+    font-size:13px;
+    padding:6px 10px;
+    border:1px solid var(--divider);
+    border-radius:999px;
+  }
+
+  .bars{display:inline-flex;align-items:flex-end;gap:2px;height:18px;width:18px;}
+  .bars i{
+    display:block;
+    width:3px;
+    border-radius:2px;
+    background:var(--accent);
+    height:40%;
+  }
+  .bars i:nth-child(1){height:35%;}
+  .bars i:nth-child(2){height:70%;}
+  .bars i:nth-child(3){height:100%;}
+  .bars i:nth-child(4){height:55%;}
+  .bars.playing i{animation:eq 0.9s ease-in-out infinite;}
+  .bars.playing i:nth-child(1){animation-delay:-0.6s;}
+  .bars.playing i:nth-child(2){animation-delay:-0.3s;}
+  .bars.playing i:nth-child(3){animation-delay:-0.9s;}
+  .bars.playing i:nth-child(4){animation-delay:-0.15s;}
+  @keyframes eq{
+    0%,100%{height:30%;}
+    50%{height:100%;}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .bars.playing i{animation:none;height:70%;}
+  }
+
+  /* ---- Поиск: широкая "лента с надписью", а не дефолтный овальный инпут. */
+  .search-row{margin-bottom:12px;}
+  #searchInput{
+    width:100%;
+    background:var(--panel);
+    border:1px solid var(--divider);
+    color:var(--text);
+    font-size:16px;
+    font-family:var(--font-body);
+    padding:12px 14px;
+    border-radius:12px;
+    outline:none;
+  }
+  #searchInput::placeholder{color:var(--hint);}
+  #searchInput:focus{border-color:var(--accent);}
+
+  /* ---- Вкладки: тактильные "кнопки деки", не скруглённые пилюли подряд. */
+  .tabs{
+    display:flex;
+    gap:6px;
+    margin-bottom:14px;
+    border-bottom:1px solid var(--divider);
+    padding-bottom:2px;
+  }
+  .tab{
+    flex:1;
+    background:transparent;
+    border:none;
+    color:var(--hint);
+    font-family:var(--font-body);
+    font-size:14px;
+    font-weight:600;
+    padding:10px 4px;
+    border-bottom:2px solid transparent;
+    cursor:pointer;
+  }
+  .tab.active{color:var(--text);border-bottom-color:var(--accent);}
+
+  /* ---- Список: строки миксте­йпа, а не сетка одинаковых карточек. */
+  .list{display:flex;flex-direction:column;}
+  .row{
+    display:flex;
+    align-items:center;
+    gap:12px;
+    padding:10px 2px;
+    border-bottom:1px solid var(--divider);
+  }
+  .row.row-playing{background:linear-gradient(90deg, rgba(255,178,56,.10), transparent 70%);}
+
+  .pad{
+    flex:none;
+    width:44px;
+    height:44px;
+    border-radius:12px;
+    border:none;
+    background:var(--panel);
+    color:var(--accent);
+    font-size:16px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    cursor:pointer;
+  }
+  .row-playing .pad{background:var(--accent);color:var(--accent-text);}
+  .row-playing .pad .bars i{background:var(--accent-text);}
+
+  .info{flex:1;min-width:0;}
+  .info .title{
+    font-size:15px;
+    font-weight:600;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px;}
+  .tag{
+    font-size:11px;
+    color:var(--hint);
+    background:var(--panel);
+    border-radius:999px;
+    padding:2px 8px;
+  }
+
+  .star{
+    flex:none;
+    background:none;
+    border:none;
+    font-size:20px;
+    color:var(--hint);
+    cursor:pointer;
+    padding:6px;
+    line-height:1;
+  }
+  .star.active{color:var(--accent);}
+
+  .load-more-wrap{text-align:center;margin-top:14px;}
+  .load-more{
+    background:var(--panel);
+    color:var(--text);
+    border:1px solid var(--divider);
+    border-radius:999px;
+    padding:10px 20px;
+    font-family:var(--font-body);
+    font-size:14px;
+    cursor:pointer;
+  }
+
+  .state-message{
+    text-align:center;
+    color:var(--hint);
+    font-size:14px;
+    padding:36px 12px;
+    line-height:1.5;
+  }
+  .state-message button{
+    margin-top:10px;
+    background:var(--accent);
+    color:var(--accent-text);
+    border:none;
+    border-radius:999px;
+    padding:9px 18px;
+    font-family:var(--font-body);
+    font-weight:600;
+    font-size:14px;
+    cursor:pointer;
+  }
+
+  .skeleton-row{
+    height:44px;
+    border-radius:12px;
+    background:linear-gradient(90deg, var(--panel) 25%, var(--divider) 50%, var(--panel) 75%);
+    background-size:200% 100%;
+    animation:shimmer 1.4s infinite;
+    margin-bottom:10px;
+  }
+  @keyframes shimmer{
+    0%{background-position:200% 0;}
+    100%{background-position:-200% 0;}
+  }
+
+  /* ---- Плеер-дек: живёт внизу, пока что-то играет. */
+  .player{
+    position:fixed;
+    left:0;right:0;bottom:0;
+    display:flex;
+    align-items:center;
+    gap:10px;
+    max-width:560px;
+    margin:0 auto;
+    padding:12px 14px calc(12px + env(safe-area-inset-bottom));
+    background:var(--panel);
+    border-top:1px solid var(--divider);
+  }
+  .player-title{
+    flex:1;
+    min-width:0;
+    font-size:14px;
+    font-weight:600;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .player-btn{
+    flex:none;
+    width:36px;
+    height:36px;
+    border-radius:10px;
+    border:none;
+    background:var(--bg);
+    color:var(--text);
+    font-size:15px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    cursor:pointer;
+  }
+  .player-btn.stop{background:var(--hot);color:#1A0000;}
+</style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <span class="brand-name">MIFki</span>
+      </div>
+      <a class="channel-link" id="channelLink" href="#" target="_blank" rel="noopener">канал ↗️</a>
+    </header>
+    <div class="search-row">
+      <input id="searchInput" type="search" inputmode="search" placeholder="искать миф…" autocomplete="off">
+    </div>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="all">Все</button>
+      <button class="tab" data-tab="popular">🔥 Топ</button>
+      <button class="tab" data-tab="mine">★ Моё</button>
+    </nav>
+
+    <main id="list" class="list" aria-live="polite"></main>
+
+    <p id="loadMoreWrap" class="load-more-wrap" hidden>
+      <button id="loadMoreBtn" class="load-more">Показать ещё</button>
+    </p>
+  </div>
+
+  <div id="player" class="player" hidden>
+    <span class="bars playing" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+    <div class="player-title" id="playerTitle">—</div>
+    <button class="player-btn" id="playerChannelBtn" title="Пост на канале">↗️</button>
+    <button class="player-btn" id="playerSendBtn" title="Прислать сюда">➤</button>
+    <button class="player-btn" id="playerShareBtn" title="Поделиться в чат">⤴️</button>
+    <button class="player-btn stop" id="playerStopBtn" title="Стоп">■</button>
+  </div>
+
+  <audio id="audioEl" preload="none"></audio>
+
+<script>
+(function(){
+  "use strict";
+
+  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+
+  function safeTg(fn){
+    // Часть методов WebApp API появилась в новых версиях клиентов — на
+    // старых Telegram они могут просто отсутствовать. Не даём такому
+    // вызову уронить всё приложение.
+    try{ fn(); }catch(e){ /* тихо игнорируем — не критично */ }
+  }
+  if (tg){
+    safeTg(function(){ tg.ready(); });
+    safeTg(function(){ tg.expand(); });
+  }
+
+  function applyTheme(){
+    if (!tg  !tg.themeParams) return;
+    var tp = tg.themeParams;
+    var root = document.documentElement.style;
+    if (tp.bg_color) root.setProperty('--bg', tp.bg_color);
+    if (tp.text_color) root.setProperty('--text', tp.text_color);
+    if (tp.hint_color) root.setProperty('--hint', tp.hint_color);
+    if (tp.secondary_bg_color) root.setProperty('--panel', tp.secondary_bg_color);
+    safeTg(function(){ tg.setHeaderColor('secondary_bg_color'); });
+    safeTg(function(){ tg.setBackgroundColor(tp.bg_color  '#14110D'); });
+  }
+  applyTheme();
+  if (tg) safeTg(function(){ tg.onEvent('themeChanged', applyTheme); });
+
+  var initData = tg ? (tg.initData  '') : '';
+
+  // --- Состояние ------------------------------------------------------
+
+  var state = {
+    tab: 'all',
+    query: '',
+    offset: 0,
+    limit: 60,
+    total: 0,
+    items: [],
+    loading: false,
+    channelUsername: ''
+  };
+
+  var currentPlayingId = null;
+  var currentPlayingSound = null;
+
+  var listEl = document.getElementById('list');
+  var loadMoreWrap = document.getElementById('loadMoreWrap');
+  var loadMoreBtn = document.getElementById('loadMoreBtn');
+  var searchInput = document.getElementById('searchInput');
+  var channelLink = document.getElementById('channelLink');
+  var audioEl = document.getElementById('audioEl');
+  var player = document.getElementById('player');
+  var playerTitle = document.getElementById('playerTitle');
+
+  // --- Запросы к backend'у ---------------------------------------------
+
+  function apiFetch(path, options){
+    options = options  {};
+    options.headers = options.headers  {};
+    if (initData) options.headers['X-Telegram-Init-Data'] = initData;
+    return fetch(path, options).then(function(response){
+      if (!response.ok){
+        return response.json().catch(function(){ return {}; }).then(function(body){
+          var message = (body && body.detail) ? body.detail : ('Ошибка ' + response.status);
+          throw new Error(message);
+        });
+      }
+      return response.json();
+    });
+  }
+
+  function loadConfig(){
+    apiFetch('/api/config').then(function(config){
+      state.channelUsername = config.channel_username  '';
+      channelLink.href = state.channelUsername ? ('https://t.me/' + state.channelUsername) : '#';
+    }).catch(function(){ /* не критично для остального интерфейса */ });
+  }
+
+  function renderSkeleton(){
+    listEl.innerHTML = '';
+    for (var i = 0; i < 6; i++){
+      var el = document.createElement('div');
+      el.className = 'skeleton-row';
+      listEl.appendChild(el);
+    }
+  }
+
+  function renderMessage(text, withRetry){
+    listEl.innerHTML = '';
+    var wrap = document.createElement('div');
+    wrap.className = 'state-message';
+    wrap.textContent = text;
+    if (withRetry){
+      var button = document.createElement('button');
+      button.textContent = 'Повторить';
+      button.onclick = function(){ fetchSounds(true); };
+      wrap.appendChild(document.createElement('br'));
+      wrap.appendChild(button);
+    }
+    listEl.appendChild(wrap);
+  }
+
+  function emptyStateText(){
+    if (state.query.trim()) return 'Ничего не нашли. Попробуй другие слова из самого мема.';
+    if (state.tab === 'mine') return 'Пока пусто. Жми ★ на звуках, которые хочешь сохранить.';
+    if (state.tab === 'popular') return 'Рейтинг пока пуст — играй звуки чаще, и здесь появится топ.';
+    return 'Звуков пока нет.';
+  }
+
+  function fetchSounds(reset){
+    if (reset){
+      state.offset = 0;
+      state.items = [];
+      renderSkeleton();
+    }
+    state.loading = true;
+
+    var params = new URLSearchParams({
+      q: state.query,
+      tab: state.tab,
+      limit: String(state.limit),
+      offset: String(state.offset)
+    });
+    apiFetch('/api/sounds?' + params.toString())
+      .then(function(data){
+        state.total = data.total;
+        state.items = reset ? data.items : state.items.concat(data.items);
+        renderList();
+      })
+      .catch(function(error){
+        renderMessage('Не получилось загрузить список: ' + error.message, true);
+      })
+      .finally(function(){
+        state.loading = false;
+      });
+  }
+
+  function renderList(){
+    listEl.innerHTML = '';
+
+    if (!state.items.length){
+      renderMessage(emptyStateText(), false);
+      loadMoreWrap.hidden = true;
+      return;
+    }
+
+    state.items.forEach(function(sound){
+      listEl.appendChild(buildRow(sound));
+    });
+
+    loadMoreWrap.hidden = state.items.length >= state.total;
+        }
+  function buildRow(sound){
+    var row = document.createElement('div');
+    row.className = 'row' + (sound.id === currentPlayingId ? ' row-playing' : '');
+    row.dataset.id = sound.id;
+
+    var pad = document.createElement('button');
+    pad.className = 'pad';
+    pad.setAttribute('aria-label', 'Слушать: ' + sound.title);
+    pad.innerHTML = sound.id === currentPlayingId
+      ? '<span class="bars playing"><i></i><i></i><i></i><i></i></span>'
+      : '▶️';
+    pad.onclick = function(){ togglePlay(sound); };
+
+    var info = document.createElement('div');
+    info.className = 'info';
+    var title = document.createElement('div');
+    title.className = 'title';
+    title.textContent = sound.title;
+    info.appendChild(title);
+
+    if (sound.tags && sound.tags.length){
+      var tagsWrap = document.createElement('div');
+      tagsWrap.className = 'tags';
+      sound.tags.forEach(function(tag){
+        var chip = document.createElement('span');
+        chip.className = 'tag';
+        chip.textContent = tag;
+        tagsWrap.appendChild(chip);
+      });
+      info.appendChild(tagsWrap);
+    }
+
+    var star = document.createElement('button');
+    star.className = 'star' + (sound.is_favorite ? ' active' : '');
+    star.setAttribute('aria-label', 'В избранное');
+    star.textContent = sound.is_favorite ? '★' : '☆';
+    star.onclick = function(){ toggleFavorite(sound, star); };
+
+    row.appendChild(pad);
+    row.appendChild(info);
+    row.appendChild(star);
+    return row;
+  }
+
+  // --- Проигрывание -----------------------------------------------------
+
+  function togglePlay(sound){
+    if (currentPlayingId === sound.id){
+      stopPlayback();
+      return;
+    }
+    currentPlayingId = sound.id;
+    currentPlayingSound = sound;
+    audioEl.src = '/api/audio/' + encodeURIComponent(sound.id);
+    audioEl.play().catch(function(error){
+      showAlert('Не получилось проиграть звук: ' + error.message);
+      stopPlayback();
+    });
+    showPlayer(sound);
+    renderList();
+  }
+
+  function stopPlayback(){
+    audioEl.pause();
+    audioEl.removeAttribute('src');
+    currentPlayingId = null;
+    currentPlayingSound = null;
+    player.hidden = true;
+    renderList();
+  }
+
+  audioEl.addEventListener('ended', stopPlayback);
+  audioEl.addEventListener('error', function(){
+    if (currentPlayingId){
+      showAlert('Не удалось загрузить звук. Попробуй ещё раз.');
+      stopPlayback();
+    }
+  });
+  function showPlayer(sound){
+    playerTitle.textContent = sound.title;
+    player.hidden = false;
+  }
+
+  document.getElementById('playerStopBtn').onclick = stopPlayback;
+
+  document.getElementById('playerChannelBtn').onclick = function(){
+    if (!currentPlayingSound  !currentPlayingSound.channel_url){
+      showAlert('У этого звука нет ссылки на пост в канале.');
+      return;
+    }
+    if (tg) safeTg(function(){ tg.openTelegramLink(currentPlayingSound.channel_url); });
+    else window.open(currentPlayingSound.channel_url, '_blank');
+  };
+
+  document.getElementById('playerSendBtn').onclick = function(){
+    if (!currentPlayingSound) return;
+    apiFetch('/api/send', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sound_id: currentPlayingSound.id})
+    }).then(function(){
+      showAlert('Отправил тебе в чат с ботом ✅');
+    }).catch(function(error){
+      showAlert('Не получилось отправить: ' + error.message);
+    });
+  };
+
+  document.getElementById('playerShareBtn').onclick = function(){
+    if (!currentPlayingSound  !tg){
+      showAlert('Поделиться можно только внутри Telegram.');
+      return;
+    }
+    safeTg(function(){
+      tg.switchInlineQuery(currentPlayingSound.title, ['users', 'groups', 'channels']);
+    });
+  };
+
+  // --- Избранное ---------------------------------------------------------
+
+  function toggleFavorite(sound, starEl){
+    var goingToAdd = !sound.is_favorite;
+    sound.is_favorite = goingToAdd;
+    starEl.textContent = goingToAdd ? '★' : '☆';
+    starEl.classList.toggle('active', goingToAdd);
+
+    apiFetch('/api/favorites', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sound_id: sound.id, action: goingToAdd ? 'add' : 'remove'})
+    }).catch(function(error){
+      // откатываем оптимистичное обновление
+      sound.is_favorite = !goingToAdd;
+      starEl.textContent = sound.is_favorite ? '★' : '☆';
+      starEl.classList.toggle('active', sound.is_favorite);
+      showAlert('Не получилось сохранить: ' + error.message);
+    });
+  }
+
+  // --- Вспомогательное -----------------------------------------------------
+
+  function showAlert(text){
+    if (tg && tg.showAlert) safeTg(function(){ tg.showAlert(text); });
+    else window.alert(text);
+  }
+
+  var searchDebounce = null;
+  searchInput.addEventListener('input', function(){
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(function(){
+      state.query = searchInput.value;
+      fetchSounds(true);
+    }, 300);
+  });
+
+  document.querySelectorAll('.tab').forEach(function(tabBtn){
+    tabBtn.addEventListener('click', function(){
+      document.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('active'); });
+      tabBtn.classList.add('active');
+      state.tab = tabBtn.dataset.tab;
+      fetchSounds(true);
+    });
+  });
+
+  loadMoreBtn.addEventListener('click', function(){
+    state.offset += state.limit;
+    fetchSounds(false);
+  });
+
+  loadConfig();
+  fetchSounds(true);
+})();
+</script>
+</body>
+</html>

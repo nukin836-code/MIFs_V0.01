@@ -1,0 +1,5 @@
+# Зависимости backend'а Mini App (webapp_api.py), поверх уже установленных
+# зависимостей самого бота (aiogram, requests, rapidfuzz, speech_recognition
+# и т.д. — они не переписаны заново, webapp_api.py их переиспользует).
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0

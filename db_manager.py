@@ -93,6 +93,33 @@ def remove_from_favorites(user_id: int | str, sound_id: int | str) -> bool:
     return False
 
 
+def get_favorites(user_id: int | str) -> list[dict[str, Any]]:
+    """Только избранное (без истории), полные записи через mif_core, в
+    порядке "самое новое первым". Нужно Mini App для отдельной вкладки
+    ★ Моё — в отличие от get_personal_menu ниже, историю сюда не подмешиваем,
+    иначе вкладка «избранное» показывала бы то, что человек туда не клал."""
+    user_id = str(user_id)
+    user = USERS_DB.get(user_id)
+    if not user:
+        return []
+
+    result: list[dict[str, Any]] = []
+    for sound_id in user["favorites"][:FAVORITES_LIMIT]:
+        sound = mif_core.get_mif_by_id(sound_id)
+        if sound is not None:
+            result.append(sound)
+    return result
+
+
+def get_favorite_ids(user_id: int | str) -> set[str]:
+    """Голое множество ID избранного — для быстрой проверки ★-статуса при
+    отрисовке произвольного списка (например вкладки «Все» или «Популярное»
+    в Mini App), без похода за полными записями через mif_core."""
+    user_id = str(user_id)
+    user = USERS_DB.get(user_id)
+    return set(user["favorites"]) if user else set()
+
+
 # --- История + глобальный рейтинг -----------------------------------------
 
 
@@ -136,9 +163,7 @@ def clear_history(user_id: int | str) -> None:
     user = _get_or_create_user(user_id)
     user["history"] = {}
     _save_users_db()
-
-
-# --- Выдача ----------------------------------------------------------------
+    # --- Выдача ----------------------------------------------------------------
 
 
 def get_popular_sounds(limit: int = 20) -> list[dict[str, Any]]:
@@ -179,4 +204,3 @@ def get_personal_menu(user_id: int | str) -> list[dict[str, Any]]:
             result.append(sound)
 
     return result
-    
