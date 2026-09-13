@@ -67,6 +67,16 @@
     border:1px solid var(--divider);
     border-radius:999px;
   }
+  .topbar-actions{display:flex;align-items:center;gap:6px;}
+  .language-select{
+    appearance:none;
+    background:var(--panel);
+    color:var(--text);
+    border:1px solid var(--divider);
+    border-radius:999px;
+    padding:6px 8px;
+    font:600 12px var(--font-body);
+  }
 
   .bars{display:inline-flex;align-items:flex-end;gap:2px;height:18px;width:18px;}
   .bars i{
@@ -279,32 +289,39 @@
         <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
         <span class="brand-name">MIFki</span>
       </div>
-      <a class="channel-link" id="channelLink" href="#" target="_blank" rel="noopener">канал ↗️</a>
+      <div class="topbar-actions">
+        <select id="languageSelect" class="language-select" aria-label="Language">
+          <option value="en">EN</option>
+          <option value="ru">RU</option>
+          <option value="uk">UK</option>
+        </select>
+        <a class="channel-link" id="channelLink" href="#" target="_blank" rel="noopener">channel ↗️</a>
+      </div>
     </header>
     <div class="search-row">
-      <input id="searchInput" type="search" inputmode="search" placeholder="искать миф…" autocomplete="off">
+      <input id="searchInput" type="search" inputmode="search" placeholder="search sounds…" autocomplete="off">
     </div>
 
     <nav class="tabs">
-      <button class="tab active" data-tab="all">Все</button>
-      <button class="tab" data-tab="popular">🔥 Топ</button>
-      <button class="tab" data-tab="mine">★ Моё</button>
+      <button class="tab active" data-tab="all">All</button>
+      <button class="tab" data-tab="popular">🔥 Popular</button>
+      <button class="tab" data-tab="mine">★ Favorites</button>
     </nav>
 
     <main id="list" class="list" aria-live="polite"></main>
 
     <p id="loadMoreWrap" class="load-more-wrap" hidden>
-      <button id="loadMoreBtn" class="load-more">Показать ещё</button>
+      <button id="loadMoreBtn" class="load-more">Load more</button>
     </p>
   </div>
 
   <div id="player" class="player" hidden>
     <span class="bars playing" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
     <div class="player-title" id="playerTitle">—</div>
-    <button class="player-btn" id="playerChannelBtn" title="Пост на канале">↗️</button>
-    <button class="player-btn" id="playerSendBtn" title="Прислать сюда">➤</button>
-    <button class="player-btn" id="playerShareBtn" title="Поделиться в чат">⤴️</button>
-    <button class="player-btn stop" id="playerStopBtn" title="Стоп">■</button>
+    <button class="player-btn" id="playerChannelBtn" title="Open channel post">↗️</button>
+    <button class="player-btn" id="playerSendBtn" title="Send to chat">➤</button>
+    <button class="player-btn" id="playerShareBtn" title="Share in chat">⤴️</button>
+    <button class="player-btn stop" id="playerStopBtn" title="Stop">■</button>
   </div>
 
   <audio id="audioEl" preload="none"></audio>
@@ -314,6 +331,69 @@
   "use strict";
 
   var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  var UI_TEXTS = {
+    en: {
+      channel: 'channel ↗️', search: 'search sounds…', all: 'All', popular: '🔥 Popular',
+      favorites: '★ Favorites', loadMore: 'Load more', retry: 'Retry',
+      noResults: 'Nothing found. Try other words from the meme.',
+      emptyMine: 'Nothing here yet. Tap ★ on sounds you want to save.',
+      emptyPopular: 'The ranking is empty — play sounds more often to build the top.',
+      emptyAll: 'No sounds yet.', listen: 'Listen: ', addFavorite: 'Add to favorites',
+      removeFavorite: 'Remove from favorites', playError: 'Could not play the sound: ',
+      channelMissing: 'This sound has no channel post link.',
+      sendSuccess: 'Sent to your bot chat ✅', sendError: 'Could not send: ',
+      shareOnly: 'Sharing is available only inside Telegram.',
+      loadError: 'Could not load the list: ', audioError: 'Could not load the sound. Try again.',
+      saveError: 'Could not save: ', stop: 'Stop',
+    },
+    ru: {
+      channel: 'канал ↗️', search: 'искать звуки…', all: 'Все', popular: '🔥 Топ',
+      favorites: '★ Избранное', loadMore: 'Показать ещё', retry: 'Повторить',
+      noResults: 'Ничего не нашли. Попробуй другие слова из мема.',
+      emptyMine: 'Пока пусто. Жми ★ на звуках, которые хочешь сохранить.',
+      emptyPopular: 'Рейтинг пока пуст — играй звуки чаще, и здесь появится топ.',
+      emptyAll: 'Звуков пока нет.', listen: 'Слушать: ', addFavorite: 'В избранное',
+      removeFavorite: 'Убрать из избранного', playError: 'Не получилось проиграть звук: ',
+      channelMissing: 'У этого звука нет ссылки на пост в канале.',
+      sendSuccess: 'Отправил тебе в чат с ботом ✅', sendError: 'Не получилось отправить: ',
+      shareOnly: 'Поделиться можно только внутри Telegram.',
+      loadError: 'Не получилось загрузить список: ', audioError: 'Не удалось загрузить звук. Попробуй ещё раз.',
+      saveError: 'Не получилось сохранить: ', stop: 'Стоп',
+    },
+    uk: {
+      channel: 'канал ↗️', search: 'шукати звуки…', all: 'Усі', popular: '🔥 Топ',
+      favorites: '★ Обране', loadMore: 'Показати ще', retry: 'Повторити',
+      noResults: 'Нічого не знайдено. Спробуй інші слова з мему.',
+      emptyMine: 'Поки порожньо. Натисни ★ на звуках, які хочеш зберегти.',
+      emptyPopular: 'Рейтинг поки порожній — слухай звуки частіше.',
+      emptyAll: 'Звуків поки немає.', listen: 'Слухати: ', addFavorite: 'Додати в обране',
+      removeFavorite: 'Прибрати з обраного', playError: 'Не вдалося відтворити звук: ',
+      channelMissing: 'У цього звуку немає посилання на допис у каналі.',
+      sendSuccess: 'Надіслано в чат із ботом ✅', sendError: 'Не вдалося надіслати: ',
+      shareOnly: 'Ділитися можна лише всередині Telegram.',
+      loadError: 'Не вдалося завантажити список: ', audioError: 'Не вдалося завантажити звук. Спробуй ще раз.',
+      saveError: 'Не вдалося зберегти: ', stop: 'Стоп',
+    }
+  };
+
+  function normalizeLanguage(code){
+    var base = String(code || '').toLowerCase().replace('_', '-').split('-')[0];
+    return ['ru', 'en', 'uk'].indexOf(base) >= 0 ? base : 'en';
+  }
+
+  var initialLanguage = normalizeLanguage(
+    tg && tg.initDataUnsafe && tg.initDataUnsafe.user
+      ? tg.initDataUnsafe.user.language_code
+      : 'en'
+  );
+
+  function tr(key){
+    var text = (UI_TEXTS[state.language] || UI_TEXTS.en)[key] || UI_TEXTS.en[key] || key;
+    for (var i = 1; i < arguments.length; i++){
+      text = text.replace('{' + (i - 1) + '}', String(arguments[i]));
+    }
+    return text;
+  }
 
   function safeTg(fn){
     // Часть методов WebApp API появилась в новых версиях клиентов — на
@@ -327,7 +407,7 @@
   }
 
   function applyTheme(){
-    if (!tg  !tg.themeParams) return;
+    if (!tg || !tg.themeParams) return;
     var tp = tg.themeParams;
     var root = document.documentElement.style;
     if (tp.bg_color) root.setProperty('--bg', tp.bg_color);
@@ -335,12 +415,12 @@
     if (tp.hint_color) root.setProperty('--hint', tp.hint_color);
     if (tp.secondary_bg_color) root.setProperty('--panel', tp.secondary_bg_color);
     safeTg(function(){ tg.setHeaderColor('secondary_bg_color'); });
-    safeTg(function(){ tg.setBackgroundColor(tp.bg_color  '#14110D'); });
+    safeTg(function(){ tg.setBackgroundColor(tp.bg_color || '#14110D'); });
   }
   applyTheme();
   if (tg) safeTg(function(){ tg.onEvent('themeChanged', applyTheme); });
 
-  var initData = tg ? (tg.initData  '') : '';
+  var initData = tg ? (tg.initData || '') : '';
 
   // --- Состояние ------------------------------------------------------
 
@@ -352,7 +432,8 @@
     total: 0,
     items: [],
     loading: false,
-    channelUsername: ''
+    channelUsername: '',
+    language: initialLanguage
   };
 
   var currentPlayingId = null;
@@ -366,17 +447,18 @@
   var audioEl = document.getElementById('audioEl');
   var player = document.getElementById('player');
   var playerTitle = document.getElementById('playerTitle');
+  var languageSelect = document.getElementById('languageSelect');
 
   // --- Запросы к backend'у ---------------------------------------------
 
   function apiFetch(path, options){
-    options = options  {};
-    options.headers = options.headers  {};
+    options = options || {};
+    options.headers = options.headers || {};
     if (initData) options.headers['X-Telegram-Init-Data'] = initData;
     return fetch(path, options).then(function(response){
       if (!response.ok){
         return response.json().catch(function(){ return {}; }).then(function(body){
-          var message = (body && body.detail) ? body.detail : ('Ошибка ' + response.status);
+          var message = (body && body.detail) ? body.detail : ('Error ' + response.status);
           throw new Error(message);
         });
       }
@@ -386,9 +468,45 @@
 
   function loadConfig(){
     apiFetch('/api/config').then(function(config){
-      state.channelUsername = config.channel_username  '';
+      state.channelUsername = config.channel_username || '';
+      state.language = normalizeLanguage(config.language || state.language);
+      languageSelect.value = state.language;
+      applyLanguage();
       channelLink.href = state.channelUsername ? ('https://t.me/' + state.channelUsername) : '#';
+      channelLink.hidden = !state.channelUsername;
     }).catch(function(){ /* не критично для остального интерфейса */ });
+  }
+
+  function applyLanguage(){
+    document.documentElement.lang = state.language;
+    channelLink.textContent = tr('channel');
+    searchInput.placeholder = tr('search');
+    document.querySelector('[data-tab="all"]').textContent = tr('all');
+    document.querySelector('[data-tab="popular"]').textContent = tr('popular');
+    document.querySelector('[data-tab="mine"]').textContent = tr('favorites');
+    loadMoreBtn.textContent = tr('loadMore');
+    document.getElementById('playerChannelBtn').title = tr('channel');
+    document.getElementById('playerSendBtn').title = tr('sendSuccess');
+    document.getElementById('playerShareBtn').title = tr('shareOnly');
+    document.getElementById('playerStopBtn').title = tr('stop');
+  }
+
+  function changeLanguage(language){
+    var previous = state.language;
+    state.language = normalizeLanguage(language);
+    applyLanguage();
+    apiFetch('/api/language', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({language: state.language})
+    }).then(function(){
+      fetchSounds(true);
+    }).catch(function(error){
+      state.language = previous;
+      languageSelect.value = previous;
+      applyLanguage();
+      showAlert(tr('saveError') + error.message);
+    });
   }
 
   function renderSkeleton(){
@@ -407,7 +525,7 @@
     wrap.textContent = text;
     if (withRetry){
       var button = document.createElement('button');
-      button.textContent = 'Повторить';
+      button.textContent = tr('retry');
       button.onclick = function(){ fetchSounds(true); };
       wrap.appendChild(document.createElement('br'));
       wrap.appendChild(button);
@@ -416,10 +534,10 @@
   }
 
   function emptyStateText(){
-    if (state.query.trim()) return 'Ничего не нашли. Попробуй другие слова из самого мема.';
-    if (state.tab === 'mine') return 'Пока пусто. Жми ★ на звуках, которые хочешь сохранить.';
-    if (state.tab === 'popular') return 'Рейтинг пока пуст — играй звуки чаще, и здесь появится топ.';
-    return 'Звуков пока нет.';
+    if (state.query.trim()) return tr('noResults');
+    if (state.tab === 'mine') return tr('emptyMine');
+    if (state.tab === 'popular') return tr('emptyPopular');
+    return tr('emptyAll');
   }
 
   function fetchSounds(reset){
@@ -443,7 +561,7 @@
         renderList();
       })
       .catch(function(error){
-        renderMessage('Не получилось загрузить список: ' + error.message, true);
+        renderMessage(tr('loadError') + error.message, true);
       })
       .finally(function(){
         state.loading = false;
@@ -464,7 +582,7 @@
     });
 
     loadMoreWrap.hidden = state.items.length >= state.total;
-        }
+  }
   function buildRow(sound){
     var row = document.createElement('div');
     row.className = 'row' + (sound.id === currentPlayingId ? ' row-playing' : '');
@@ -472,7 +590,7 @@
 
     var pad = document.createElement('button');
     pad.className = 'pad';
-    pad.setAttribute('aria-label', 'Слушать: ' + sound.title);
+    pad.setAttribute('aria-label', tr('listen') + sound.title);
     pad.innerHTML = sound.id === currentPlayingId
       ? '<span class="bars playing"><i></i><i></i><i></i><i></i></span>'
       : '▶️';
@@ -499,7 +617,7 @@
 
     var star = document.createElement('button');
     star.className = 'star' + (sound.is_favorite ? ' active' : '');
-    star.setAttribute('aria-label', 'В избранное');
+    star.setAttribute('aria-label', sound.is_favorite ? tr('removeFavorite') : tr('addFavorite'));
     star.textContent = sound.is_favorite ? '★' : '☆';
     star.onclick = function(){ toggleFavorite(sound, star); };
 
@@ -520,7 +638,7 @@
     currentPlayingSound = sound;
     audioEl.src = '/api/audio/' + encodeURIComponent(sound.id);
     audioEl.play().catch(function(error){
-      showAlert('Не получилось проиграть звук: ' + error.message);
+      showAlert(tr('playError') + error.message);
       stopPlayback();
     });
     showPlayer(sound);
@@ -539,7 +657,7 @@
   audioEl.addEventListener('ended', stopPlayback);
   audioEl.addEventListener('error', function(){
     if (currentPlayingId){
-      showAlert('Не удалось загрузить звук. Попробуй ещё раз.');
+      showAlert(tr('audioError'));
       stopPlayback();
     }
   });
@@ -551,8 +669,8 @@
   document.getElementById('playerStopBtn').onclick = stopPlayback;
 
   document.getElementById('playerChannelBtn').onclick = function(){
-    if (!currentPlayingSound  !currentPlayingSound.channel_url){
-      showAlert('У этого звука нет ссылки на пост в канале.');
+    if (!currentPlayingSound || !currentPlayingSound.channel_url){
+      showAlert(tr('channelMissing'));
       return;
     }
     if (tg) safeTg(function(){ tg.openTelegramLink(currentPlayingSound.channel_url); });
@@ -566,15 +684,15 @@
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({sound_id: currentPlayingSound.id})
     }).then(function(){
-      showAlert('Отправил тебе в чат с ботом ✅');
+      showAlert(tr('sendSuccess'));
     }).catch(function(error){
-      showAlert('Не получилось отправить: ' + error.message);
+      showAlert(tr('sendError') + error.message);
     });
   };
 
   document.getElementById('playerShareBtn').onclick = function(){
-    if (!currentPlayingSound  !tg){
-      showAlert('Поделиться можно только внутри Telegram.');
+    if (!currentPlayingSound || !tg){
+      showAlert(tr('shareOnly'));
       return;
     }
     safeTg(function(){
@@ -599,7 +717,7 @@
       sound.is_favorite = !goingToAdd;
       starEl.textContent = sound.is_favorite ? '★' : '☆';
       starEl.classList.toggle('active', sound.is_favorite);
-      showAlert('Не получилось сохранить: ' + error.message);
+      showAlert(tr('saveError') + error.message);
     });
   }
 
@@ -633,6 +751,11 @@
     fetchSounds(false);
   });
 
+  languageSelect.addEventListener('change', function(){
+    changeLanguage(languageSelect.value);
+  });
+
+  applyLanguage();
   loadConfig();
   fetchSounds(true);
 })();

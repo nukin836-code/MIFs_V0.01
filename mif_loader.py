@@ -36,6 +36,8 @@ import import_myinstants as importer
 import import_tiktok
 import mif_bugs   # report_bug живёт здесь, не в mif_core
 import mif_core
+import db_manager
+import i18n
 
 logger = logging.getLogger("mif-bot.loader")
 
@@ -333,6 +335,7 @@ async def import_one_sound(
     session: requests.Session,
     sound: dict[str, str],
     notify_func=None,
+    language: str | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """
     Для /loads цикла: источник уже известен (всегда MyInstants).
@@ -341,7 +344,7 @@ async def import_one_sound(
     title = sound["title"]
 
     if notify_func:
-        await notify_func("📥 Скачиваю с MyInstants...")
+        await notify_func(i18n.t("download", language))
 
     try:
         audio_bytes = await asyncio.to_thread(importer.download_audio, session, sound["url"])
@@ -351,7 +354,7 @@ async def import_one_sound(
     except Exception as direct_err:
         logger.info("Прямое скачивание не вышло (%s) → yt-dlp: %s", type(direct_err).__name__, title)
         if notify_func:
-            await notify_func("📥 Cloudflare блок → пробую yt-dlp...")
+            await notify_func(i18n.t("cloudflare", language))
         try:
             audio_bytes = await _download_via_ytdlp(sound["url"])
         except Exception as ytdlp_err:
@@ -363,7 +366,7 @@ async def import_one_sound(
             return "error", None
 
     if notify_func:
-        await notify_func("⚙️ Конвертирую в Voice OGG + распознаю речь...")
+        await notify_func(i18n.t("convert", language))
 
     return await _convert_and_publish(bot, audio_bytes, {**sound, "source_type": "myinstants"})
 
@@ -375,6 +378,7 @@ async def import_one_sound(
 async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> None:
     session = _mi_session()
     pager = importer.CatalogPager()
+    language = db_manager.get_user_language(chat_id)
 
     try:
         while not loader_state.stop_event.is_set():
@@ -432,7 +436,7 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
         try:
             await bot.send_message(
                 chat_id,
-                f"⏹ Автозагрузка остановлена. Добавлено: {loader_state.added_count}.",
+                i18n.t("loader_stopped", language, count=loader_state.added_count),
             )
         except TelegramAPIError:
             pass
@@ -440,8 +444,12 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
 
 
 async def handle_loads_start(message: Message, target_count: int | None) -> None:
+    language = db_manager.ensure_user_language(
+        message.from_user.id if message.from_user else message.chat.id,
+        message.from_user.language_code if message.from_user else None,
+    )
     if loader_state.task is not None and not loader_state.task.done():
-        await message.answer("⚠️ Автозагрузка уже запущена. Останови через /loadsStop.")
+        await message.answer(i18n.t("loads_already", language))
         return
 
     loader_state.stop_event = asyncio.Event()
@@ -452,18 +460,23 @@ async def handle_loads_start(message: Message, target_count: int | None) -> None
     )
 
     if target_count:
-        await message.answer(f"▶️ Запуск (цель: {target_count}). Остановка — /loadsStop.")
+        await message.answer(i18n.t("loads_start_target", language, count=target_count))
     else:
-        await message.answer("▶️ Запуск (бесконечно). Остановка — /loadsStop.")
+        await message.answer(i18n.t("loads_start_forever", language))
 
 
 async def handle_loads_stop(message: Message) -> None:
+    language = db_manager.get_user_language(
+        message.from_user.id if message.from_user else message.chat.id
+    )
     if loader_state.task is None or loader_state.task.done():
-        await message.answer("Автозагрузка сейчас не запущена.")
+        await message.answer(i18n.t("loads_not_running", language))
         return
 
     loader_state.stop_event.set()
-    await message.answer(f"⏸ Останавливаю (доработаю паузу {LOADS_STEP_DELAY_SECONDS:.0f} сек).")
+    await message.answer(
+        i18n.t("loads_stopping", language, seconds=LOADS_STEP_DELAY_SECONDS)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -471,16 +484,16 @@ async def handle_loads_stop(message: Message) -> None:
 # ---------------------------------------------------------------------------
 
 async def handle_loads_search(message: Message, query: str) -> None:
+    language = db_manager.ensure_user_language(
+        message.from_user.id if message.from_user else message.chat.id,
+        message.from_user.language_code if message.from_user else None,
+    )
     if not query:
-        await message.answer('/loadsSearch "текст" — укажи запрос.')
+        await message.answer(i18n.t("loads_search_usage", language))
         return
 
     status_msg = await message.answer(
-        "🏁 <b>Гонка трёх источников:</b>\n"
-        "• 🎬 TikTok (DDG → ssstik)\n"
-        "• 🎵 MyInstants (прямое скачивание)\n"
-        "• 🔧 MyInstants (yt-dlp)\n\n"
-        "Параллельно ищу и скачиваю — победит самый быстрый...",
+        i18n.t("loads_race_status", language),
         parse_mode="HTML",
     )
 
@@ -493,7 +506,7 @@ async def handle_loads_search(message: Message, query: str) -> None:
     result = await _race_all_sources(query)
 
     if result is None:
-        await upd("❌ <b>Все источники не нашли ничего.</b>\nПопробуй другой запрос.")
+        await upd(i18n.t("loads_no_results", language))
         return
 
     audio_bytes, sound = result
@@ -504,31 +517,26 @@ async def handle_loads_search(message: Message, query: str) -> None:
     # Проверка дубликата по названию
     existing = mif_core.find_duplicate_by_title(title)
     if existing:
-        await upd(f"⚠️ <b>Дубликат!</b> «{title}» уже в базе.")
+        await upd(i18n.t("loads_duplicate_title", language, title=title))
         await message.answer_voice(voice=existing["file_id"])
         return
 
-    await upd(
-        f"⚡ <b>{source_label} выиграл!</b>\n"
-        f"«{title}» → конвертирую и публикую..."
-    )
+    await upd(i18n.t("loads_winner", language, source=source_label, title=title))
 
     status, entry = await _convert_and_publish(message.bot, audio_bytes, sound)
 
     if status == "duplicate" and entry:
-        await upd(f"⚠️ <b>Дубликат по хэшу!</b> Совпадает с «{entry.get('title')}».")
+        await upd(i18n.t("loads_duplicate_hash", language, title=entry.get("title")))
         await message.answer_voice(voice=entry["file_id"])
         return
 
     if status == "added" and entry:
         await upd(
-            f"✅ <b>Добавлен!</b>\n"
-            f"Источник: {source_label}\n"
-            f"Название: {entry['title']}"
+            i18n.t("loads_added", language, source=source_label, title=entry["title"])
         )
         return
 
-    await upd("⚠️ Ошибка публикации.")
+    await upd(i18n.t("loads_publish_error", language))
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +548,7 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     Один статусный messages, редактируется. Те же 3 параллельные цепочки.
     """
     muted = mif_core.is_muted(requester_id)
+    language = db_manager.get_user_language(requester_id)
     can_message = True
 
     status_msg = None
@@ -547,8 +556,7 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
         try:
             status_msg = await bot.send_message(
                 requester_id,
-                f"🔍 <b>Автопоиск:</b> «{query_text}»\n"
-                "TikTok · MyInstants · yt-dlp — параллельно...",
+                i18n.t("auto_search_status", language, query=query_text),
                 parse_mode="HTML",
             )
         except TelegramAPIError:
@@ -564,7 +572,7 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     result = await _race_all_sources(query_text)
 
     if result is None:
-        await notify(f"⚠️ Не нашёл «{query_text}» нигде.")
+        await notify(i18n.t("auto_search_none", language, query=query_text))
         return
 
     audio_bytes, sound = result
@@ -572,18 +580,18 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     source_type = sound.get("source_type", "myinstants")
     source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
 
-    await notify(f"⚡ <b>{source_label} выиграл!</b>\n«{title}» → публикую...")
+    await notify(i18n.t("loads_winner", language, source=source_label, title=title))
 
     if mif_core.find_duplicate_by_title(title):
-        await notify("✅ Уже есть в базе.")
+        await notify(i18n.t("auto_search_existing", language))
         return
 
     status, entry = await _convert_and_publish(bot, audio_bytes, sound)
 
     if status in ("added", "duplicate") and entry:
-        await notify(f"✅ <b>Готово!</b> «{entry['title']}» добавлен.")
+        await notify(i18n.t("auto_search_done", language, title=entry["title"]))
     elif status == "error":
-        await notify("⚠️ Ошибка при конвертации или публикации.")
+        await notify(i18n.t("auto_search_error", language))
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +599,10 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
 # ---------------------------------------------------------------------------
 
 async def handle_loads_commands(message: Message) -> None:
+    language = db_manager.ensure_user_language(
+        message.from_user.id if message.from_user else message.chat.id,
+        message.from_user.language_code if message.from_user else None,
+    )
     text = (message.text or "").strip()
 
     search_match = LOADS_SEARCH_RE.match(text)
@@ -599,7 +611,7 @@ async def handle_loads_commands(message: Message) -> None:
         return
 
     if message.from_user is None or message.from_user.id != LOADS_ADMIN_ID:
-        await message.answer("⛔ Только для администратора.")
+        await message.answer(i18n.t("only_admin", language))
         return
 
     if text == "/loadsStop":
@@ -614,11 +626,5 @@ async def handle_loads_commands(message: Message) -> None:
         await handle_loads_start(message, target_count=int(count_match.group(1)))
         return
 
-    await message.answer(
-        "Не понял. Доступно:\n"
-        "/loads — бесконечная автозагрузка\n"
-        "/loads5 — загрузить 5 новых MIFов\n"
-        "/loadsStop — остановить\n"
-        '/loadsSearch "запрос" — найти и загрузить звук'
-    )
+    await message.answer(i18n.t("loads_usage", language))
     

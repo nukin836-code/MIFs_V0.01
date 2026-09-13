@@ -1,0 +1,1 @@
+- [Mini App runtime](miniapp-runtime.md) — the Mini App API has a separate dependency/runtime path from the Telegram bot workflow.

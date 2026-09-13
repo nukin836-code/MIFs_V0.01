@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import mif_core
+import i18n
 
 logger = logging.getLogger("mif-bot.db")
 
@@ -61,8 +62,63 @@ def _save_popular_db() -> None:
 
 def _get_or_create_user(user_id: str) -> dict[str, Any]:
     if user_id not in USERS_DB:
-        USERS_DB[user_id] = {"favorites": [], "history": {}, "used_sound_ids": []}
-    return USERS_DB[user_id]
+        USERS_DB[user_id] = {
+            "favorites": [],
+            "history": {},
+            "used_sound_ids": [],
+            "language": i18n.DEFAULT_LANGUAGE,
+        }
+    user = USERS_DB[user_id]
+    user.setdefault("favorites", [])
+    user.setdefault("history", {})
+    user.setdefault("used_sound_ids", [])
+    user.setdefault("language", i18n.DEFAULT_LANGUAGE)
+    return user
+
+
+def get_user_language(user_id: int | str) -> str:
+    """Возвращает сохранённый язык пользователя, не меняя его выбор."""
+    user = USERS_DB.get(str(user_id))
+    if not user:
+        return i18n.DEFAULT_LANGUAGE
+    return i18n.normalize_language(user.get("language"))
+
+
+def ensure_user_language(user_id: int | str, telegram_language: str | None = None) -> str:
+    """Создаёт пользователя и определяет язык только при первом контакте.
+
+    Если пользователь уже выбрал язык вручную, последующие language_code от
+    Telegram его выбор не перезаписывают.
+    """
+    key = str(user_id)
+    user = USERS_DB.get(key)
+    detected = i18n.normalize_language(telegram_language)
+    if user is None:
+        user = _get_or_create_user(key)
+        user["language"] = detected
+        _save_users_db()
+        return detected
+
+    changed = False
+    if "language" not in user:
+        user["language"] = detected
+        changed = True
+    else:
+        normalized = i18n.normalize_language(user["language"])
+        if user["language"] != normalized:
+            user["language"] = normalized
+            changed = True
+    if changed:
+        _save_users_db()
+    return i18n.normalize_language(user["language"])
+
+
+def set_user_language(user_id: int | str, language: str) -> str:
+    user = _get_or_create_user(str(user_id))
+    normalized = i18n.normalize_language(language)
+    user["language"] = normalized
+    _save_users_db()
+    return normalized
 
 
 # --- Избранное -----------------------------------------------------------

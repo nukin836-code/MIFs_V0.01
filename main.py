@@ -32,6 +32,7 @@ from aiogram.types import (
 import mif_core
 import mif_loader
 import db_manager
+import i18n
 
 logger = logging.getLogger("mif-bot")
 
@@ -50,47 +51,50 @@ class AddMif(StatesGroup):
     waiting_for_description = State()
 
 
-# --- /start с выбором языка ---------------------------------------------------
+# --- Язык пользователя и /start ---------------------------------------------
 
-_LANG_KEYBOARD = InlineKeyboardMarkup(
-    inline_keyboard=[[
-        InlineKeyboardButton(text="🇷🇺 Русский",    callback_data="lang_ru"),
-        InlineKeyboardButton(text="🇬🇧 English",    callback_data="lang_en"),
-        InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang_ua"),
-    ]]
-)
 
-_START_TEXTS: dict[str, str] = {
-    "ru": (
-        "🔊 <b>MIFki Bot</b>\n\n"
-        "Ищи звуки через инлайн: <code>@MIFki_bot запрос</code>\n"
-        "Добавь свой — пришли аудиофайл в этот чат.\n\n"
-        "/app — открыть все звуки в приложении\n"
-        "/help — все команды"
-    ),
-    "en": (
-        "🔊 <b>MIFki Bot</b>\n\n"
-        "Search sounds via inline: <code>@MIFki_bot query</code>\n"
-        "Add your own — send an audio file here.\n\n"
-        "/app — open all sounds in the app\n"
-        "/help — all commands"
-    ),
-    "ua": (
-        "🔊 <b>MIFki Bot</b>\n\n"
-        "Шукай звуки через інлайн: <code>@MIFki_bot запит</code>\n"
-        "Додай свій — надішли аудіофайл у цей чат.\n\n"
-        "/app — відкрити всі звуки в застосунку\n"
-        "/help — всі команди"
-    ),
-}
+def _message_language(message: Message) -> str:
+    user = message.from_user
+    if user is None:
+        return i18n.DEFAULT_LANGUAGE
+    return db_manager.ensure_user_language(user.id, user.language_code)
+
+
+def _callback_language(callback: CallbackQuery) -> str:
+    return db_manager.ensure_user_language(
+        callback.from_user.id,
+        callback.from_user.language_code,
+    )
+
+
+def _language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=i18n.LANGUAGE_LABELS["ru"], callback_data="lang_ru"),
+            InlineKeyboardButton(text=i18n.LANGUAGE_LABELS["en"], callback_data="lang_en"),
+            InlineKeyboardButton(text=i18n.LANGUAGE_LABELS["uk"], callback_data="lang_uk"),
+        ]]
+    )
 
 
 @dp.message(Command("start"), F.chat.type == "private")
 async def start_private_chat(message: Message, state: FSMContext) -> None:
     await state.clear()
+    lang = _message_language(message)
     await message.answer(
-        "👋 Выбери язык / Choose language / Обери мову:",
-        reply_markup=_LANG_KEYBOARD,
+        f"👋 {i18n.t('language_prompt', lang)}\n\n{i18n.t('start', lang)}",
+        parse_mode="HTML",
+        reply_markup=_language_keyboard(),
+    )
+
+
+@dp.message(Command("language"), F.chat.type == "private")
+async def language_command(message: Message) -> None:
+    lang = _message_language(message)
+    await message.answer(
+        i18n.t("language_current", lang, language_name=i18n.language_label(lang)),
+        reply_markup=_language_keyboard(),
     )
 
 
@@ -99,9 +103,9 @@ async def handle_language_choice(callback: CallbackQuery) -> None:
     if not callback.message:
         await callback.answer()
         return
-    lang = (callback.data or "lang_ru").split("_", 1)[-1]
-    text = _START_TEXTS.get(lang, _START_TEXTS["ru"])
-    await callback.message.edit_text(text, parse_mode="HTML")
+    lang = i18n.normalize_language((callback.data or "lang_en").split("_", 1)[-1])
+    db_manager.set_user_language(callback.from_user.id, lang)
+    await callback.message.edit_text(i18n.t("start", lang), parse_mode="HTML")
     await callback.answer()
 
 
@@ -109,11 +113,12 @@ async def handle_language_choice(callback: CallbackQuery) -> None:
 
 @dp.message(Command("cancel"), F.chat.type == "private")
 async def cancel_addition(message: Message, state: FSMContext) -> None:
+    lang = _message_language(message)
     if await state.get_state() is None:
-        await message.answer("Сейчас нечего отменять.")
+        await message.answer(i18n.t("cancel_none", lang))
         return
     await state.clear()
-    await message.answer("Добавление звука отменено.")
+    await message.answer(i18n.t("cancel_done", lang))
 
 
 # --- /mute / /unmute ----------------------------------------------------------
@@ -122,24 +127,27 @@ async def cancel_addition(message: Message, state: FSMContext) -> None:
 async def mute_command(message: Message) -> None:
     if message.from_user is None:
         return
+    lang = _message_language(message)
     mif_core.mute_user(message.from_user.id)
-    await message.answer("🔕 Уведомления отключены. Включить — /unmute.")
+    await message.answer(i18n.t("mute_on", lang))
 
 @dp.message(Command("unmute"), F.chat.type == "private")
 async def unmute_command(message: Message) -> None:
     if message.from_user is None:
         return
+    lang = _message_language(message)
     mif_core.unmute_user(message.from_user.id)
-    await message.answer("🔔 Уведомления включены.")
+    await message.answer(i18n.t("mute_off", lang))
 
 
 # --- /popular / /clear_history ------------------------------------------------
 
 @dp.message(Command("popular"), F.chat.type == "private")
 async def popular_command(message: Message) -> None:
+    lang = _message_language(message)
     top_sounds = db_manager.get_popular_sounds(limit=20)
     if not top_sounds:
-        await message.answer("Рейтинг пока пуст.")
+        await message.answer(i18n.t("popular_empty", lang))
         return
 
     keyboard_buttons = []
@@ -151,17 +159,22 @@ async def popular_command(message: Message) -> None:
         ])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer("🏆 <b>Топ-20 популярных звуков:</b>", parse_mode="HTML", reply_markup=keyboard)
+    await message.answer(
+        i18n.t("popular_title", lang),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
 
 
 @dp.callback_query(F.data.startswith("play_"))
 async def play_popular_sound(callback: CallbackQuery) -> None:
+    lang = _callback_language(callback)
     mif_id = callback.data.split("play_", 1)[-1]
     # Используем правильную функцию вызова из mif_core:
     mif = mif_core.get_mif_by_id(mif_id)
 
     if not mif:
-        await callback.answer("❌ Звук не найден в базе", show_alert=True)
+        await callback.answer(i18n.t("sound_not_found", lang), show_alert=True)
         return
 
     file_id = mif.get("file_id")
@@ -178,81 +191,77 @@ async def play_popular_sound(callback: CallbackQuery) -> None:
 async def clear_history_command(message: Message) -> None:
     if message.from_user is None:
         return
+    lang = _message_language(message)
     db_manager.clear_history(message.from_user.id)
-    await message.answer("🗑 История очищена. Избранное не тронуто.")
+    await message.answer(i18n.t("history_cleared", lang))
 
 
 # --- /app — открыть Mini App ---------------------------------------------------
 
 @dp.message(Command("app"), F.chat.type == "private")
 async def open_miniapp(message: Message) -> None:
+    lang = _message_language(message)
     if not MINIAPP_URL:
-        await message.answer(
-            "⚠️ Приложение сейчас не настроено (не задан MINIAPP_URL). "
-            "Спроси администратора бота."
-        )
+        await message.answer(i18n.t("app_unconfigured", lang))
         return
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="🔊 Открыть MIFki", web_app=WebAppInfo(url=MINIAPP_URL))
+            InlineKeyboardButton(
+                text=i18n.t("app_button", lang),
+                web_app=WebAppInfo(url=MINIAPP_URL),
+            )
         ]]
     )
     await message.answer(
-        "Все звуки из @MIFFFKI в одном приложении — ищи, слушай, отправляй в чат.",
+        i18n.t("app_intro", lang),
         reply_markup=keyboard,
     )
 
 
 # --- /help --------------------------------------------------------------------
 
-HELP_TEXT = (
-    "🔊 <b>MIFki</b>\n\n"
-    "<code>@MIFki_bot запрос</code> — найти звук в любом чате\n\n"
-    "/app — открыть все звуки в приложении\n"
-    "/popular — топ-20 популярных звуков\n"
-    "/clear_history — очистить свою историю\n"
-    "/mute · /unmute — уведомления об автопоиске\n"
-    "/cancel — отменить добавление звука\n\n"
-    "<b>Добавить звук:</b> пришли аудиофайл → напиши описание\n\n"
-    '/loadsSearch "текст" — найти и добавить звук из интернета'
-)
-
-_HELP_KEYBOARD = InlineKeyboardMarkup(
-    inline_keyboard=[[
-        InlineKeyboardButton(text="ℹ️ /info — о боте", callback_data="show_info"),
-    ]]
-)
+def _help_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text=i18n.t("button_info", lang),
+                callback_data="show_info",
+            ),
+        ]]
+    )
 
 
 @dp.message(Command("help"), F.chat.type == "private")
 async def show_help(message: Message) -> None:
-    await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=_HELP_KEYBOARD)
+    lang = _message_language(message)
+    await message.answer(
+        i18n.t("help", lang),
+        parse_mode="HTML",
+        reply_markup=_help_keyboard(lang),
+    )
 
 
 # --- /info --------------------------------------------------------------------
-def _build_info_text() -> str:
+def _build_info_text(lang: str) -> str:
     count = len(mif_core.MIFS_DATABASE)
-    return (
-        "ℹ️ <b>MIFki Bot</b>\n\n"
-        f"Звуков в базе: <b>{count}</b>\n"
-        "Канал: @MIFFFKI\n"
-        "Поиск: @MIFki_bot\n\n"
-        "Источники: MyInstants · TikTok\n"
-        "Распознавание: Google STT (ru + en)\n"
-        "Дедупликация: SHA-256 аудиохэш\n"
-        "Защита от дублей: asyncio.Lock"
-    )
+    return i18n.t("info", lang, count=count, channel=mif_core.CHANNEL_ID)
 
 
 @dp.message(Command("info"), F.chat.type == "private")
 async def show_info(message: Message) -> None:
-    await message.answer(_build_info_text(), parse_mode="HTML")
+    await message.answer(
+        _build_info_text(_message_language(message)),
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data == "show_info")
 async def handle_info_button(callback: CallbackQuery) -> None:
-    await callback.message.answer(_build_info_text(), parse_mode="HTML")
+    await callback.message.answer(
+        _build_info_text(_callback_language(callback)),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
@@ -267,6 +276,7 @@ async def loads_commands(message: Message) -> None:
 
 @dp.message(F.chat.type == "private", F.audio | F.voice)
 async def handle_audio_upload(message: Message, state: FSMContext) -> None:
+    lang = _message_language(message)
     if message.audio is not None:
         file_id = message.audio.file_id
         file_type = "audio"
@@ -274,15 +284,12 @@ async def handle_audio_upload(message: Message, state: FSMContext) -> None:
         file_id = message.voice.file_id
         file_type = "voice"
     else:
-        await message.answer("Не удалось определить тип аудио.")
+        await message.answer(i18n.t("audio_unknown", lang))
         return
 
     await state.update_data(file_id=file_id, file_type=file_type)
     await state.set_state(AddMif.waiting_for_description)
-    await message.answer(
-        "✅ Аудио получено!\n"
-        "Теперь отправь описание и теги. /cancel — отменить."
-    )
+    await message.answer(i18n.t("audio_received", lang))
 
 
 @dp.message(
@@ -291,15 +298,16 @@ async def handle_audio_upload(message: Message, state: FSMContext) -> None:
     F.text,
 )
 async def handle_description(message: Message, state: FSMContext) -> None:
+    lang = _message_language(message)
     user_description = (message.text or "").strip()
 
     if not user_description:
-        await message.answer("⚠️ Описание не может быть пустым.")
+        await message.answer(i18n.t("description_empty", lang))
         return
 
     if len(user_description) > MAX_DESCRIPTION_LENGTH:
         await message.answer(
-            f"⚠️ Описание слишком длинное (макс. {MAX_DESCRIPTION_LENGTH} символов)."
+            i18n.t("description_too_long", lang, max_length=MAX_DESCRIPTION_LENGTH)
         )
         return
 
@@ -309,10 +317,10 @@ async def handle_description(message: Message, state: FSMContext) -> None:
 
     if not isinstance(file_id, str) or file_type not in {"audio", "voice"}:
         await state.clear()
-        await message.answer("Срок ожидания истёк. Отправь аудио ещё раз.")
+        await message.answer(i18n.t("state_expired", lang))
         return
 
-    await message.answer("⏳ Распознаю речь и готовлю файл...")
+    await message.answer(i18n.t("processing_audio", lang))
 
     try:
         bot_description, transcription_error, ogg_bytes, content_hash = (
@@ -321,8 +329,7 @@ async def handle_description(message: Message, state: FSMContext) -> None:
     except RuntimeError as error:
         logger.exception("Не удалось подготовить аудио к публикации")
         await message.answer(
-            f"⚠️ {error}\n"
-            "Добавление не отменено — отправь описание ещё раз или /cancel."
+            i18n.t("prepare_error", lang, error=error)
         )
         return
 
@@ -357,8 +364,7 @@ async def handle_description(message: Message, state: FSMContext) -> None:
     except TelegramAPIError:
         logger.exception("Не удалось опубликовать MIF в канале %s", mif_core.CHANNEL_ID)
         await message.answer(
-            "⚠️ Не удалось отправить в канал.\n"
-            "Добавление не отменено — попробуй ещё раз или /cancel."
+            i18n.t("publish_error", lang)
         )
         return
 
@@ -367,41 +373,38 @@ async def handle_description(message: Message, state: FSMContext) -> None:
     if status == "duplicate":
         duplicate_title = new_mif.get("title") or "без названия"
         await message.answer(
-            f"⚠️ Такой звук уже есть в базе: «{duplicate_title}».\n"
-            "Ообрежь или измени файл, если думаешь, что это ошибка."
+            i18n.t("duplicate", lang, title=duplicate_title)
         )
         return
 
     if transcription_error:
         await message.answer(
-            "✅ Опубликовано в @MIFFFKI.\n"
-            f"⚠️ Авто-описание: {transcription_error}"
+            i18n.t("published_with_warning", lang, error=transcription_error)
         )
     else:
         await message.answer(
-            "✅ Опубликовано в @MIFFFKI.\n"
-            f"Авто-описание: {new_mif['bot_description']}"
+            i18n.t("published", lang, description=new_mif["bot_description"])
         )
 
 
 @dp.message(AddMif.waiting_for_description, F.chat.type == "private")
 async def handle_non_text_description(message: Message) -> None:
-    await message.answer("⚠️ Отправь текстовое описание или /cancel.")
+    await message.answer(i18n.t("description_required", _message_language(message)))
 
 
 # --- Неизвестные команды (ловушка, стоит последней) --------------------------
 
 @dp.message(F.chat.type == "private", F.text.startswith("/"))
 async def handle_unknown_command(message: Message) -> None:
+    lang = _message_language(message)
     text = (message.text or "").strip()
-    hint = ""
-    if text.lower().startswith("/load") and not text.lower().startswith("/loads"):
-        hint = (
-            "\nПохоже, опечатка — команда называется "
-            "<code>/loads</code> (с «s» на конце)."
-        )
+    hint = (
+        i18n.t("unknown_command_hint", lang)
+        if text.lower().startswith("/load") and not text.lower().startswith("/loads")
+        else ""
+    )
     await message.answer(
-        f"Не знаю команду: {html.escape(text)}.{hint}\n/help — список команд.",
+        i18n.t("unknown_command", lang, command=html.escape(text), hint=hint),
         parse_mode="HTML",
     )
 
@@ -410,6 +413,7 @@ async def handle_unknown_command(message: Message) -> None:
 
 @dp.inline_query()
 async def search_mifs(query: InlineQuery) -> None:
+    db_manager.ensure_user_language(query.from_user.id, query.from_user.language_code)
     query_text = query.query.strip()
 
     if not query_text:
@@ -424,7 +428,7 @@ async def search_mifs(query: InlineQuery) -> None:
         mif_id   = str(mif.get("id", ""))
         file_id  = str(mif.get("file_id", ""))
         file_type = mif.get("file_type", mif.get("media_type", "voice"))
-        title    = str(mif.get("title", mif.get("user_description", "Звук")))
+        title    = str(mif.get("title", mif.get("user_description", "Sound")))
 
         if file_type == "audio":
             results.append(
@@ -438,7 +442,7 @@ async def search_mifs(query: InlineQuery) -> None:
                 InlineQueryResultCachedVoice(
                     id=mif_id,
                     voice_file_id=file_id,
-                    title=title[:64] or "Голосовое сообщение",
+                    title=title[:64] or i18n.t("voice_message", db_manager.get_user_language(query.from_user.id)),
                 )
             )
 

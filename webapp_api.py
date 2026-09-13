@@ -47,12 +47,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import db_manager
+import i18n
 import mif_core
 
 logger = logging.getLogger("mif-bot.miniapp")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_USERNAME = mif_core.CHANNEL_ID.lstrip("@")
+CHANNEL_USERNAME = (
+    mif_core.CHANNEL_ID.lstrip("@")
+    if str(mif_core.CHANNEL_ID).startswith("@")
+    else ""
+)
 
 # Сколько секунд считаем initData ещё свежей. Telegram сам не ограничивает
 # срок жизни, ограничение — наша защита от повторного использования
@@ -64,6 +69,10 @@ AUDIO_CACHE_DIR = Path(__file__).with_name("audio_cache")
 AUDIO_CACHE_DIR.mkdir(exist_ok=True)
 
 WEBAPP_STATIC_DIR = Path(__file__).with_name("webapp")
+if not WEBAPP_STATIC_DIR.exists():
+    # Старый файл в проекте был создан с опечаткой wabapp. Поддерживаем его
+    # как fallback, чтобы API не падал до переименования каталога.
+    WEBAPP_STATIC_DIR = Path(__file__).with_name("wabapp")
 
 # Список отдаётся вкладками, а не одним махом — на большой базе присылать
 # клиенту сразу все тысячи записей ни к чему, да и Mini App живёт в WebView
@@ -134,14 +143,23 @@ def validate_init_data(init_data: str, bot_token: str, max_age_seconds: int) -> 
     return parsed
 
 
-def _extract_user_id(parsed_init_data: dict[str, str]) -> int:
+def _extract_user(parsed_init_data: dict[str, str]) -> dict:
     raw_user = parsed_init_data.get("user")
     if not raw_user:
         raise ValueError("В initData нет поля user")
     try:
         user = json.loads(raw_user)
-        return int(user["id"])
+        if not isinstance(user, dict):
+            raise ValueError
+        return user
     except (JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError("Не удалось прочитать user из initData") from error
+
+
+def _extract_user_id(parsed_init_data: dict[str, str]) -> int:
+    try:
+        return int(_extract_user(parsed_init_data)["id"])
+    except (KeyError, TypeError, ValueError) as error:
         raise ValueError("Не удалось прочитать user.id из initData") from error
 
 
@@ -153,7 +171,10 @@ def get_user_id_required(
         raise HTTPException(500, "BOT_TOKEN не настроен на сервере")
     try:
         parsed = validate_init_data(x_telegram_init_data, BOT_TOKEN, INIT_DATA_MAX_AGE_SECONDS)
-        return _extract_user_id(parsed)
+        user = _extract_user(parsed)
+        user_id = int(user["id"])
+        db_manager.ensure_user_language(user_id, user.get("language_code"))
+        return user_id
     except ValueError as error:
         raise HTTPException(401, str(error)) from error
 
@@ -168,7 +189,10 @@ def get_user_id_optional(
         return None
     try:
         parsed = validate_init_data(x_telegram_init_data, BOT_TOKEN, INIT_DATA_MAX_AGE_SECONDS)
-        return _extract_user_id(parsed)
+        user = _extract_user(parsed)
+        user_id = int(user["id"])
+        db_manager.ensure_user_language(user_id, user.get("language_code"))
+        return user_id
     except ValueError:
         return None
 
@@ -214,8 +238,11 @@ def _text_filter(records: list[dict], query_text: str) -> list[dict]:
 
 
 @app.get("/api/config")
-def get_config() -> dict:
-    return {"channel_username": CHANNEL_USERNAME}
+def get_config(user_id: int | None = Depends(get_user_id_optional)) -> dict:
+    return {
+        "channel_username": CHANNEL_USERNAME,
+        "language": db_manager.get_user_language(user_id) if user_id is not None else i18n.DEFAULT_LANGUAGE,
+    }
 
 
 @app.get("/api/sounds")
@@ -253,6 +280,24 @@ def list_sounds(
 class FavoriteRequest(BaseModel):
     sound_id: str
     action: str  # "add" | "remove"
+
+
+class LanguageRequest(BaseModel):
+    language: str
+
+
+@app.post("/api/language")
+def set_language(
+    payload: LanguageRequest,
+    user_id: int = Depends(get_user_id_required),
+) -> dict:
+    language = i18n.normalize_language(payload.language)
+    db_manager.set_user_language(user_id, language)
+    return {
+        "ok": True,
+        "language": language,
+        "label": i18n.language_label(language),
+    }
 
 
 @app.post("/api/favorites")
