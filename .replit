@@ -73,6 +73,27 @@ author = 42830275
 task = "workflow.run"
 args = "MIF Telegram Bot"
 
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "MIF Mini App"
+
+[[workflows.workflow]]
+name = "MIF Mini App"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run uvicorn webapp_api:app --host 0.0.0.0 --port ${PORT:-8000}"
+waitForPort = 8000
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
 [agent]
 stack = "PNPM_WORKSPACE"
 expertMode = true
@@ -83,9 +104,14 @@ timeoutMs = 20000
 
 [nix]
 channel = "stable-25_05"
-packages = ["ffmpeg"]
+packages = ["ffmpeg", "rapidfuzz-cpp", "taskflow"]
 
 [userenv]
 
 [userenv.shared]
 CHANNEL_ID = "-1004309168724"
+MINIAPP_URL = "https://be88f350-d912-4518-9d80-390b66f2c8e0-00-2htucimwrim5u.riker.replit.dev"
+
+[[ports]]
+localPort = 8000
+externalPort = 80

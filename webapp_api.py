@@ -205,6 +205,11 @@ def serialize_sound(mif: dict, favorite_ids: set[str]) -> dict:
     title = str(mif.get("title") or mif.get("user_description") or "Без названия")
     tags_source = str(mif.get("user_tags") or mif.get("tags") or "")
     channel_message_id = mif.get("channel_message_id")
+    channel_url = (
+        f"https://t.me/{CHANNEL_USERNAME}/{channel_message_id}"
+        if CHANNEL_USERNAME and channel_message_id
+        else None
+    )
 
     return {
         "id": mif_id,
@@ -212,9 +217,7 @@ def serialize_sound(mif: dict, favorite_ids: set[str]) -> dict:
         "description": str(mif.get("bot_description") or ""),
         "tags": [tag for tag in tags_source.split() if tag][:6],
         "media_type": mif.get("file_type") or mif.get("media_type") or "voice",
-        "channel_url": (
-            f"https://t.me/{CHANNEL_USERNAME}/{channel_message_id}" if channel_message_id else None
-        ),
+        "channel_url": channel_url,
         "is_favorite": mif_id in favorite_ids,
     }
 
