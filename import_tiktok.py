@@ -19,6 +19,29 @@ class NotAudioContentError(Exception):
         self.content_type = content_type
 
 
+SEARCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Origin": "https://lite.duckduckgo.com",
+    "Referer": "https://lite.duckduckgo.com/",
+}
+
+SSSTIK_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "HX-Request": "true",
+    "HX-Current-URL": "https://ssstik.io/ru",
+    "Origin": "https://ssstik.io",
+    "Referer": "https://ssstik.io/ru",
+}
+
+
 async def search_catalog(
     session: requests.Session,
     query: str,
@@ -31,17 +54,12 @@ async def search_catalog(
     search_query = f"tiktok {query}"
     url = "https://lite.duckduckgo.com/lite/"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Origin": "https://lite.duckduckgo.com",
-        "Referer": "https://lite.duckduckgo.com/",
-    }
     data = {"q": search_query, "kl": ""}
 
     try:
         logger.info("🌐 POST к DuckDuckGo Lite: '%s'", search_query)
         response = await asyncio.to_thread(
-            session.post, url, data=data, headers=headers, timeout=7
+            session.post, url, data=data, headers=SEARCH_HEADERS, timeout=7
         )
         logger.info(
             "📥 Ответ DDG Lite: статус %s, %s байт",
@@ -53,7 +71,11 @@ async def search_catalog(
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
-        video_links: set[str] = set()
+        # Сохраняем порядок выдачи. set здесь ломал главный смысл этого
+        # провайдера: пользовательский запрос должен идти в первый результат
+        # поисковика, а не в случайную ссылку из множества.
+        video_links: list[str] = []
+        seen_links: set[str] = set()
 
         total_links_found = 0
         for a in soup.find_all("a", href=True):
@@ -72,7 +94,9 @@ async def search_catalog(
                 "/video/" in href or "vt.tiktok.com" in href or "/@" in href
             ):
                 logger.info("🎯 TikTok ссылка: %s", href)
-                video_links.add(href)
+                if href not in seen_links:
+                    seen_links.add(href)
+                    video_links.append(href)
 
         logger.info(
             "📊 Просмотрено ссылок: %d. TikTok ссылок: %d",
@@ -138,4 +162,92 @@ def download_audio(session: requests.Session, tiktok_page_url: str) -> bytes:
     except Exception as e:
         logger.exception("🚨 Ошибка при скачивании через локальный сервер TikTok: %s", e)
         raise
+
+
+def _extract_ssstik_download_link(html: str) -> str | None:
+    """Извлекает прямую ссылку из ответа ssstik.io.
+
+    SSSTik иногда меняет подписи кнопок, поэтому сначала ищем ссылку по
+    смыслу кнопки, а затем используем более широкий резерв по доменам/расширениям.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    for link in soup.find_all("a", href=True):
+        href = str(link["href"])
+        text = link.get_text(" ", strip=True).lower()
+        if (
+            ("download" in text or "mp3" in text or "аудио" in text)
+            and ("dl" in href or "mp3" in href or "tikcdn" in href)
+        ):
+            return href
+
+    for link in soup.find_all("a", href=True):
+        href = str(link["href"])
+        if "tikcdn" in href or ".mp4" in href or ".mp3" in href:
+            return href
+
+    return None
+
+
+def download_audio_via_ssstik(
+    session: requests.Session,
+    tiktok_page_url: str,
+) -> bytes:
+    """Медленный, но точный путь: TikTok URL → SSSTik → прямой медиафайл.
+
+    Сначала забираем свежий скрытый токен ``tt`` со страницы SSSTik. Это
+    важно: отправка старого пустого токена периодически возвращает HTML
+    ошибки вместо ссылки на скачивание.
+    """
+    logger.info("📥 [SSSTIK DOWNLOAD START] Ссылка: %s", tiktok_page_url)
+
+    landing = session.get(
+        "https://ssstik.io/ru",
+        headers=SSSTIK_HEADERS,
+        timeout=10,
+    )
+    landing.raise_for_status()
+    token_node = BeautifulSoup(landing.text, "html.parser").find(
+        "input", {"name": "tt"}
+    )
+    token = str(token_node.get("value", "")) if token_node else ""
+    if not token:
+        raise RuntimeError("SSSTik не вернул защитный токен tt")
+
+    parsed = session.post(
+        "https://ssstik.io/abc?url=dl",
+        data={"id": tiktok_page_url, "locale": "ru", "tt": token},
+        headers=SSSTIK_HEADERS,
+        timeout=15,
+    )
+    parsed.raise_for_status()
+
+    media_url = _extract_ssstik_download_link(parsed.text)
+    if not media_url:
+        raise NotAudioContentError(
+            "SSSTik не вернул прямую ссылку на медиафайл."
+        )
+    if media_url.startswith("//"):
+        media_url = f"https:{media_url}"
+    elif media_url.startswith("/"):
+        media_url = f"https://ssstik.io{media_url}"
+    elif not media_url.startswith(("http://", "https://")):
+        media_url = f"https://ssstik.io/{media_url}"
+
+    audio_response = session.get(media_url, timeout=25)
+    audio_response.raise_for_status()
+    content_type = audio_response.headers.get("Content-Type", "").lower()
+    if "text" in content_type or "html" in content_type:
+        raise NotAudioContentError(
+            "SSSTik вернул HTML вместо аудио.",
+            content_type=content_type,
+        )
+    if not audio_response.content:
+        raise NotAudioContentError("SSSTik вернул пустой файл.")
+
+    logger.info(
+        "✅ [SSSTIK DOWNLOAD DONE] Получено %d байт",
+        len(audio_response.content),
+    )
+    return audio_response.content
         
