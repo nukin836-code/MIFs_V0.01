@@ -1,1 +1,2 @@
 - [Mini App runtime](miniapp-runtime.md) — the Mini App API has a separate dependency/runtime path from the Telegram bot workflow.
+- [Audio storage model](telegram-audio-storage.md) — Telegram is the only durable audio store; the project keeps searchable metadata and hashes.

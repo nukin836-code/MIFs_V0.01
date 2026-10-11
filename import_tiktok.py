@@ -1,7 +1,8 @@
 import asyncio
 import logging
-from urllib.parse import quote_plus, urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs
 
+import aiohttp
 import requests
 from bs4 import BeautifulSoup
 from aiogram import Bot
@@ -142,26 +143,8 @@ async def search_catalog(
 
 
 def download_audio(session: requests.Session, tiktok_page_url: str) -> bytes:
-    logger.info("📥 [TIKTOK DOWNLOAD] Запрос к локальному серверу: %s", tiktok_page_url)
-
-    # Стучимся на локальный FastAPI сервер, запущенный в Termux (tiktok_server.py)
-    local_api_url = f"http://127.0.0.1:8000/download?url={quote_plus(tiktok_page_url)}"
-
-    try:
-        resp = session.get(local_api_url, timeout=25)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Локальный сервер вернул ошибку {resp.status_code}: {resp.text}"
-            )
-        if len(resp.content) == 0:
-            raise RuntimeError("Локальный сервер отдал пустой файл (0 байт).")
-
-        logger.info("✅ Аудио получено через локальный сервер. Размер: %d байт", len(resp.content))
-        return resp.content
-
-    except Exception as e:
-        logger.exception("🚨 Ошибка при скачивании через локальный сервер TikTok: %s", e)
-        raise
+    """Совместимый sync-интерфейс старого пути, теперь напрямую через SSSTik."""
+    return download_audio_via_ssstik(session, tiktok_page_url)
 
 
 def _extract_ssstik_download_link(html: str) -> str | None:
@@ -250,4 +233,152 @@ def download_audio_via_ssstik(
         len(audio_response.content),
     )
     return audio_response.content
+
+
+async def search_catalog_async(
+    session: aiohttp.ClientSession,
+    query: str,
+    min_score: int = 0,
+    max_results: int = 5,
+) -> list[tuple[int, dict[str, str]]]:
+    """Отменяемый asyncio-вариант DDG Lite поиска TikTok.
+
+    Сохраняет точный порядок выдачи: первый TikTok URL — главный кандидат,
+    как в прежнем пользовательском сценарии.
+    """
+    search_query = f"tiktok {query}"
+    try:
+        async with session.post(
+            "https://lite.duckduckgo.com/lite/",
+            data={"q": search_query, "kl": ""},
+            headers=SEARCH_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as response:
+            if response.status != 200:
+                logger.info("DDG Lite ответил HTTP %s", response.status)
+                return []
+            page_html = await response.text()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        logger.debug("DDG Lite поиск не удался для %r", query, exc_info=True)
+        return []
+
+    soup = BeautifulSoup(page_html, "html.parser")
+    links: list[str] = []
+    seen: set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor["href"])
+        if "uddg=" in href:
+            href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
+        if (
+            "tiktok.com" in href.lower()
+            and ("/video/" in href or "vt.tiktok.com" in href or "/@" in href)
+            and href not in seen
+        ):
+            seen.add(href)
+            links.append(href)
+
+    results: list[tuple[int, dict[str, str]]] = []
+    for index, link in enumerate(links[:max_results]):
+        score = max(0, 80 - index * 10)
+        if score >= min_score:
+            results.append(
+                (score, {"title": f"{query} (TikTok #{index + 1})", "url": link})
+            )
+    return results
+
+
+async def download_audio_via_tikwm_async(
+    session: aiohttp.ClientSession,
+    tiktok_page_url: str,
+) -> bytes:
+    """Быстрый TikWM путь; вызывающий код включает yt-dlp как резерв."""
+    headers = {"User-Agent": SEARCH_HEADERS["User-Agent"]}
+    async with session.get(
+        "https://www.tikwm.com/api/",
+        params={"url": tiktok_page_url},
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=12),
+    ) as response:
+        response.raise_for_status()
+        payload = await response.json(content_type=None)
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    media_url = (data or {}).get("music") or (data or {}).get("play")
+    if not media_url:
+        raise RuntimeError("TikWM не вернул ссылку на аудио")
+    if media_url.startswith("/"):
+        media_url = f"https://www.tikwm.com{media_url}"
+
+    async with session.get(
+        media_url,
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=20),
+    ) as response:
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        content = await response.read()
+    if not content or "text" in content_type or "html" in content_type:
+        raise NotAudioContentError(
+            "TikWM вернул пустой ответ или HTML вместо аудио.",
+            content_type=content_type,
+        )
+    return content
+
+
+async def download_audio_via_ssstik_async(
+    session: aiohttp.ClientSession,
+    tiktok_page_url: str,
+) -> bytes:
+    """Точный резервный путь через SSSTik с динамическим токеном ``tt``.
+
+    Использует cancellable aiohttp-запросы, поэтому при победе другого
+    источника незавершённые SSSTik-запросы закрываются вместе с задачей.
+    """
+    async with session.get(
+        "https://ssstik.io/ru",
+        headers=SSSTIK_HEADERS,
+        timeout=aiohttp.ClientTimeout(total=12),
+    ) as response:
+        response.raise_for_status()
+        landing_html = await response.text()
+
+    token_node = BeautifulSoup(landing_html, "html.parser").find(
+        "input", {"name": "tt"}
+    )
+    token = str(token_node.get("value", "")) if token_node else ""
+    if not token:
+        raise RuntimeError("SSSTik не вернул защитный токен tt")
+
+    async with session.post(
+        "https://ssstik.io/abc?url=dl",
+        data={"id": tiktok_page_url, "locale": "ru", "tt": token},
+        headers=SSSTIK_HEADERS,
+        timeout=aiohttp.ClientTimeout(total=18),
+    ) as response:
+        response.raise_for_status()
+        result_html = await response.text()
+
+    media_url = _extract_ssstik_download_link(result_html)
+    if not media_url:
+        raise NotAudioContentError("SSSTik не вернул прямую ссылку на медиафайл.")
+    if media_url.startswith("//"):
+        media_url = f"https:{media_url}"
+    elif media_url.startswith("/"):
+        media_url = f"https://ssstik.io{media_url}"
+    elif not media_url.startswith(("http://", "https://")):
+        media_url = f"https://ssstik.io/{media_url}"
+
+    async with session.get(
+        media_url,
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as response:
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        content = await response.read()
+    if not content or "text" in content_type or "html" in content_type:
+        raise NotAudioContentError(
+            "SSSTik вернул пустой ответ или HTML вместо аудио.",
+            content_type=content_type,
+        )
+    return content
         

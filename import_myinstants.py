@@ -26,6 +26,7 @@ import time
 from typing import Any
 from urllib.parse import quote, quote_plus, urljoin
 
+import aiohttp
 import requests
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
@@ -458,6 +459,148 @@ async def search_catalog(
         f"{candidates[0][0]:.0f} «{candidates[0][1]['title']}»" if candidates else "нет",
     )
     return candidates[:max_results]
+
+
+async def search_catalog_async(
+    session: aiohttp.ClientSession,
+    query: str,
+    *,
+    max_results: int = 10,
+    min_score: float = mif_core.FUZZY_MATCH_THRESHOLD,
+) -> list[tuple[float, dict[str, str]]]:
+    """Асинхронная версия поиска для конкурентной гонки провайдеров.
+
+    В отличие от requests-варианта выше, все HTTP-запросы здесь отменяются
+    вместе с asyncio-задачей, если другой источник уже выиграл.
+    """
+    translated = await asyncio.to_thread(mif_core.translate_to_english, query)
+    variants = [query] + ([translated] if translated else [])
+    seen_urls: set[str] = set()
+    candidates: list[tuple[float, dict[str, str]]] = []
+
+    def consider(sound: dict[str, str], threshold: float) -> None:
+        if sound["url"] in seen_urls:
+            return
+        seen_urls.add(sound["url"])
+        score = max(
+            mif_core.fuzzy_match_score(variant, sound["title"])
+            for variant in variants
+        )
+        if score >= threshold:
+            candidates.append((score, sound))
+
+    async def fetch_api(variant: str) -> list[dict[str, str]]:
+        url = f"{MYINSTANTS_API_URL}?name={quote_plus(variant)}&format=json"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status != 200:
+                    return []
+                payload = await response.json(content_type=None)
+            return _parse_api_payload(payload, variant)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            logger.debug("Асинхронный API-поиск MI не удался для %r", variant, exc_info=True)
+            return []
+
+    api_results = await asyncio.gather(*(fetch_api(variant) for variant in variants))
+    for sounds in api_results:
+        for sound in sounds:
+            consider(sound, min_score)
+
+    if not candidates:
+        async def fetch_html_search(variant: str) -> list[dict[str, str]]:
+            url = MYINSTANTS_SEARCH_URL.format(query=quote_plus(variant))
+            try:
+                async with session.get(
+                    url,
+                    headers=MYINSTANTS_HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    if response.status != 200:
+                        return []
+                    return parse_page(await response.text())
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                logger.debug("Асинхронный HTML-поиск MI не удался для %r", variant, exc_info=True)
+                return []
+
+        html_results = await asyncio.gather(
+            *(fetch_html_search(variant) for variant in variants)
+        )
+        for sounds in html_results:
+            for sound in sounds:
+                consider(sound, min_score)
+
+    if not candidates:
+        threshold = max(min_score, mif_core.FUZZY_MATCH_THRESHOLD)
+
+        async def fetch_category(category: str) -> list[dict[str, str]]:
+            url = _category_url(category, 1)
+            try:
+                async with session.get(
+                    url,
+                    headers=MYINSTANTS_HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    if response.status in {404, 410}:
+                        return []
+                    if response.status == 403:
+                        raise CatalogBlockedError(
+                            f"MyInstants ответил 403 на категории «{category}»"
+                        )
+                    response.raise_for_status()
+                    return parse_page(await response.text())
+            except CatalogBlockedError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                logger.debug("Не удалось проверить категорию MI %r", category, exc_info=True)
+                return []
+
+        category_results = await asyncio.gather(
+            *(fetch_category(category) for category in MYINSTANTS_CATEGORIES),
+            return_exceptions=True,
+        )
+        for result in category_results:
+            if isinstance(result, CatalogBlockedError):
+                raise result
+            if isinstance(result, Exception):
+                continue
+            for sound in result:
+                consider(sound, threshold)
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    return candidates[:max_results]
+
+
+async def download_audio_async(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> bytes:
+    """Скачивает MI-аудио через HTTP, который можно отменить при победе гонки."""
+    async with session.get(
+        url,
+        headers=MYINSTANTS_HEADERS,
+        timeout=aiohttp.ClientTimeout(total=60),
+    ) as response:
+        response.raise_for_status()
+        content_length = response.headers.get("content-length")
+        if content_length and int(content_length) > MAX_FILE_SIZE_BYTES:
+            raise AudioTooLargeError
+
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            total += len(chunk)
+            if total > MAX_FILE_SIZE_BYTES:
+                raise AudioTooLargeError
+            chunks.append(chunk)
+
+        audio_bytes = b"".join(chunks)
+        head = audio_bytes[:512].lstrip().lower()
+        if head.startswith((b"<!doctype", b"<html", b"<?xml")) or b"<head" in head[:200]:
+            raise NotAudioContentError(
+                response.headers.get("content-type", ""),
+                audio_bytes[:200],
+            )
+        return audio_bytes
 
 
 def download_audio(session: requests.Session, url: str) -> bytes:

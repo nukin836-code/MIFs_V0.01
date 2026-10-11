@@ -9,9 +9,8 @@ HTTP-обёртка поверх уже существующих mif_core.py (с
 
 Реальные аудиофайлы лежат в Telegram (у бота есть file_id на каждый звук),
 поэтому:
-  - для проигрывания в приложении используется прокси-эндпоинт /api/audio/*,
-    который один раз качает файл через Bot API и дальше отдаёт его из
-    локального кэша на диске (см. AUDIO_CACHE_DIR);
+  - для проигрывания в приложении прокси-эндпоинт /api/audio/* забирает
+    аудио из Telegram и передаёт его из памяти, не создавая копии в проекте;
   - "Открыть на канале" в интерфейсе — обычная ссылка t.me/<канал>/<msg_id>,
     подгружать её содержимое самим тут не нужно.
 
@@ -32,6 +31,7 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import time
 from contextlib import asynccontextmanager
@@ -42,7 +42,7 @@ from urllib.parse import parse_qsl
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -64,9 +64,6 @@ CHANNEL_USERNAME = (
 # перехваченной когда-то строки. Сутки с запасом хватает для одной сессии
 # использования приложения.
 INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60
-
-AUDIO_CACHE_DIR = Path(__file__).with_name("audio_cache")
-AUDIO_CACHE_DIR.mkdir(exist_ok=True)
 
 WEBAPP_STATIC_DIR = Path(__file__).with_name("webapp")
 if not WEBAPP_STATIC_DIR.exists():
@@ -354,7 +351,7 @@ async def send_to_chat(payload: SendRequest, user_id: int = Depends(get_user_id_
 
 
 @app.get("/api/audio/{sound_id}")
-async def stream_audio(sound_id: str) -> FileResponse:
+async def stream_audio(sound_id: str) -> Response:
     """Отдаёт сам файл для проигрывания в <audio>. Публично (без initData) —
     это то же самое аудио, что и так открыто любому в самом канале, поэтому
     отдельная авторизация тут не нужна, важна была только для операций от
@@ -366,23 +363,32 @@ async def stream_audio(sound_id: str) -> FileResponse:
     if mif is None:
         raise HTTPException(404, "Такого звука нет в базе")
 
-    cache_path = AUDIO_CACHE_DIR / f"{sound_id}.ogg"
-    if not cache_path.exists():
-        file_id = mif.get("file_id")
-        if not file_id:
-            raise HTTPException(404, "У записи нет file_id")
-        try:
-            telegram_file = await _bot.get_file(file_id)
-            if telegram_file.file_path is None:
-                raise HTTPException(502, "Telegram не вернул путь к файлу")
-            buffer = await _bot.download_file(telegram_file.file_path)
-        except TelegramAPIError as error:
-            raise HTTPException(502, f"Не удалось скачать файл у Telegram: {error}") from error
-        if buffer is None:
-            raise HTTPException(502, "Telegram не отдал содержимое файла")
-        cache_path.write_bytes(buffer.read())
+    file_id = mif.get("file_id")
+    if not file_id:
+        raise HTTPException(404, "У записи нет file_id")
+    try:
+        telegram_file = await _bot.get_file(file_id)
+        if telegram_file.file_path is None:
+            raise HTTPException(502, "Telegram не вернул путь к файлу")
+        buffer = await _bot.download_file(telegram_file.file_path)
+    except TelegramAPIError as error:
+        raise HTTPException(502, f"Не удалось скачать файл у Telegram: {error}") from error
+    if buffer is None:
+        raise HTTPException(502, "Telegram не отдал содержимое файла")
 
-    return FileResponse(cache_path, media_type="audio/ogg")
+    # Telegram — единственное хранилище исходных аудио. Передаём полученные
+    # байты из памяти и не оставляем их в каталоге проекта или audio_cache.
+    audio_bytes = buffer.read()
+    media_type = mimetypes.guess_type(telegram_file.file_path)[0] or (
+        "audio/ogg"
+        if (mif.get("file_type") or mif.get("media_type")) == "voice"
+        else "audio/mpeg"
+    )
+    return Response(
+        content=audio_bytes,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # Статика (index.html, css, js) — монтируется последней, чтобы /api/* маршруты

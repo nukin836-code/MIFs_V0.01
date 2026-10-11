@@ -1,16 +1,18 @@
 """
 Автозагрузка звуков с TikTok и MyInstants: /loads, /loadsN, /loadsStop, /loadsSearch.
 
-Для /loadsSearch и background_internet_lookup используется гонка трёх
-параллельных цепочек (поиск+скачивание). Побеждает первая вернувшая байты.
+Для /loadsSearch и background_internet_lookup используется гонка четырёх
+загрузчиков (TikTok fast/SSSTik и MyInstants direct/yt-dlp). Побеждает
+первая ветка, которая вернула аудиобайты.
 
 Цепочки:
-  1. TikTok DDG → ssstik (локальный сервер)
-  2. MyInstants API → прямое скачивание (importer.download_audio)
-  3. MyInstants API → yt-dlp
+  1. TikTok DDG → TikWM → yt-dlp
+  2. TikTok DDG → SSSTik (точный резервный downloader)
+  3. MyInstants API → прямое скачивание
+  4. MyInstants API → yt-dlp
 
-MI поиск выполняется ОДИН РАЗ и шарится между цепочками 2 и 3.
-Победитель конвертируется и публикуется. Проигравшие отменяются без следа.
+Поиск TikTok и MyInstants выполняется один раз и шарится между их
+загрузчиками. При победе остальные HTTP-запросы и yt-dlp процессы отменяются.
 
 Для /loads (фоновый цикл по категориям) гонка не нужна — источник всегда
 MyInstants, используется import_one_sound напрямую.
@@ -23,11 +25,11 @@ import html
 import logging
 import os
 import re
-import tempfile
+import sys
 from typing import Any
 
+import aiohttp
 import requests
-import yt_dlp
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
@@ -118,63 +120,72 @@ async def _debounced_lookup(bot: Bot, requester_id: int, query_text: str) -> Non
 
 
 async def _download_via_ytdlp(url: str) -> bytes:
-    """Скачивает через yt-dlp (резерв когда прямой HTTP заблокирован)."""
-    def _run() -> bytes:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            opts = {
-                "format": "bestaudio/best",
-                "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
-                "quiet": True,
-                "no_warnings": True,
-            }
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
-                files = os.listdir(tmpdir)
-                if not files:
-                    raise RuntimeError("yt-dlp не извлёк файл")
-                with open(os.path.join(tmpdir, files[0]), "rb") as f:
-                    return f.read()
+    """Скачивает yt-dlp в stdout без создания файлов в проекте.
 
-    return await asyncio.to_thread(_run)
+    Запуск отдельным процессом позволяет завершить yt-dlp при победе другого
+    источника; отмена coroutine вокруг to_thread этого не делает.
+    """
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--format",
+        "bestaudio/best",
+        "--output",
+        "-",
+        "--quiet",
+        "--no-warnings",
+        url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=75)
+    except asyncio.CancelledError:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+        raise
+    except asyncio.TimeoutError as error:
+        process.kill()
+        await process.wait()
+        raise RuntimeError("yt-dlp превысил лимит ожидания 75 секунд") from error
+
+    if process.returncode != 0 or not stdout:
+        details = stderr.decode("utf-8", errors="replace")[-1200:]
+        raise RuntimeError(f"yt-dlp завершился с кодом {process.returncode}: {details}")
+    return stdout
 
 
 # ---------------------------------------------------------------------------
-# Гонка трёх источников (core логика /loadsSearch и background_lookup)
+# Конкурентная гонка провайдеров (/loadsSearch и background lookup)
 # ---------------------------------------------------------------------------
 
 async def _race_all_sources(
     query: str,
     *,
-    timeout: float = 45.0,
+    timeout: float = 75.0,
 ) -> tuple[bytes, dict[str, str]] | None:
     """
-    Запускает три параллельные цепочки (поиск + скачивание).
+    Одновременно запускает поиски и четыре загрузчика.
     Возвращает (audio_bytes, sound_info) первой успешной цепочки.
-    Остальные отменяются немедленно после победителя.
+    При победе отменяет HTTP-запросы и завершает yt-dlp процессы.
 
     Цепочки:
-      1. TikTok DDG → ssstik (локальный FastAPI)
-      2. MyInstants API → прямое скачивание
-      3. MyInstants API → yt-dlp
-    MI поиск выполняется один раз, результат шарится между 2 и 3.
+      1. TikTok DDG → TikWM → yt-dlp
+      2. TikTok DDG → SSSTik (точный резервный downloader)
+      3. MyInstants API → прямое скачивание
+      4. MyInstants API → yt-dlp
+    Каждый поиск выполняется один раз и отдаёт кандидата двум загрузчикам.
     """
-    # --- Общий кэш MI поиска ---
     mi_result: list[tuple[float, dict]] = []
     mi_done = asyncio.Event()
+    tiktok_result: list[tuple[int, dict[str, str]]] = []
+    tiktok_done = asyncio.Event()
 
-    async def do_mi_search() -> None:
-        try:
-            cands = await importer.search_catalog(
-                _mi_session(), query,
-                min_score=mif_core.FUZZY_MATCH_FLOOR, max_results=1,
-            )
-            mi_result.extend(cands)
-        except Exception:
-            pass
-        finally:
-            mi_done.set()
-
-    # --- Победный слот (атомарен в asyncio — нет await внутри try_claim) ---
     won = asyncio.Event()
     winner: list[tuple[bytes, dict]] = []
 
@@ -185,88 +196,137 @@ async def _race_all_sources(
         winner.append((audio, sound))
         return True
 
-    # --- Цепочка 1: TikTok ---
-    async def pipeline_tiktok() -> None:
-        try:
-            cands = await asyncio.wait_for(
-                import_tiktok.search_catalog(
-                    requests.Session(), query,
-                    min_score=mif_core.FUZZY_MATCH_FLOOR, max_results=1,
-                ),
-                timeout=8.0,
-            )
-            if not cands or won.is_set():
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=75),
+        connector=aiohttp.TCPConnector(limit=20),
+    ) as http:
+        async def do_mi_search() -> None:
+            try:
+                results = await importer.search_catalog_async(
+                    http,
+                    query,
+                    min_score=mif_core.FUZZY_MATCH_FLOOR,
+                    max_results=1,
+                )
+                mi_result.extend(results)
+            except Exception as error:
+                logger.debug("race: поиск MyInstants упал: %s", error)
+            finally:
+                mi_done.set()
+
+        async def do_tiktok_search() -> None:
+            try:
+                results = await import_tiktok.search_catalog_async(
+                    http,
+                    query,
+                    min_score=int(mif_core.FUZZY_MATCH_FLOOR),
+                    max_results=1,
+                )
+                tiktok_result.extend(results)
+            except Exception as error:
+                logger.debug("race: поиск TikTok упал: %s", error)
+            finally:
+                tiktok_done.set()
+
+        async def tiktok_candidate() -> dict[str, str] | None:
+            await tiktok_done.wait()
+            if won.is_set() or not tiktok_result:
+                return None
+            return tiktok_result[0][1]
+
+        async def pipeline_tiktok_fast() -> None:
+            try:
+                found = await tiktok_candidate()
+                if found is None:
+                    return
+                sound = {**found, "source_type": "tiktok"}
+                try:
+                    audio = await import_tiktok.download_audio_via_tikwm_async(
+                        http, sound["url"]
+                    )
+                except Exception as tikwm_error:
+                    if won.is_set():
+                        return
+                    logger.debug(
+                        "race: TikWM не сработал (%s), запускаю yt-dlp",
+                        tikwm_error,
+                    )
+                    audio = await _download_via_ytdlp(sound["url"])
+                if try_claim(audio, sound):
+                    logger.info("race: TikTok fast ПОБЕДИЛ «%s»", sound["title"])
+            except Exception as error:
+                logger.debug("race: TikTok fast упал: %s", error)
+
+        async def pipeline_tiktok_ssstik() -> None:
+            try:
+                found = await tiktok_candidate()
+                if found is None or won.is_set():
+                    return
+                sound = {**found, "source_type": "tiktok_ssstik"}
+                logger.info("race: SSSTik начал загрузку «%s»", sound["title"])
+                audio = await import_tiktok.download_audio_via_ssstik_async(
+                    http, sound["url"]
+                )
+                if try_claim(audio, sound):
+                    logger.info("race: SSSTik ПОБЕДИЛ «%s»", sound["title"])
+            except Exception as error:
+                logger.debug("race: SSSTik pipeline упал: %s", error)
+
+        async def pipeline_mi_direct() -> None:
+            await mi_done.wait()
+            if not mi_result or won.is_set():
                 return
-            _, sound = cands[0]
-            sound = {**sound, "source_type": "tiktok"}
-            logger.debug("race: TikTok нашёл «%s», запускаю ssstik", sound["title"])
-            audio = await asyncio.to_thread(
-                import_tiktok.download_audio, requests.Session(), sound["url"]
+            try:
+                _, found = mi_result[0]
+                sound = {**found, "source_type": "myinstants"}
+                audio = await importer.download_audio_async(http, sound["url"])
+                if try_claim(audio, sound):
+                    logger.info("race: MI прямое ПОБЕДИЛО «%s»", sound["title"])
+            except importer.AudioTooLargeError:
+                logger.debug("race: MI прямое: файл >20 МБ")
+            except Exception as error:
+                logger.debug("race: MI прямое упало: %s", error)
+
+        async def pipeline_mi_ytdlp() -> None:
+            await mi_done.wait()
+            if not mi_result or won.is_set():
+                return
+            try:
+                _, found = mi_result[0]
+                sound = {**found, "source_type": "myinstants"}
+                audio = await _download_via_ytdlp(sound["url"])
+                if try_claim(audio, sound):
+                    logger.info("race: MI yt-dlp ПОБЕДИЛ «%s»", sound["title"])
+            except Exception as error:
+                logger.debug("race: MI yt-dlp упал: %s", error)
+
+        # Все источники и загрузчики стартуют одновременно. SSSTik не ждёт
+        # провала быстрых источников — он получает тот же результат поиска.
+        tasks = [
+            asyncio.create_task(do_mi_search(), name="mif-mi-search"),
+            asyncio.create_task(do_tiktok_search(), name="mif-tiktok-search"),
+            asyncio.create_task(pipeline_mi_direct(), name="mif-mi-direct"),
+            asyncio.create_task(pipeline_mi_ytdlp(), name="mif-mi-ytdlp"),
+            asyncio.create_task(pipeline_tiktok_fast(), name="mif-tiktok-fast"),
+            asyncio.create_task(pipeline_tiktok_ssstik(), name="mif-tiktok-ssstik"),
+        ]
+
+        remaining = set(tasks)
+        deadline = asyncio.get_running_loop().time() + timeout
+        while remaining and not won.is_set():
+            time_left = deadline - asyncio.get_running_loop().time()
+            if time_left <= 0:
+                break
+            _, remaining = await asyncio.wait(
+                remaining,
+                timeout=time_left,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            if try_claim(audio, sound):
-                logger.debug("race: TikTok ПОБЕДИЛ «%s»", sound["title"])
-        except Exception as e:
-            logger.debug("race: TikTok pipeline упал: %s", e)
 
-    # --- Цепочка 2: MyInstants прямое скачивание ---
-    async def pipeline_mi_direct() -> None:
-        await mi_done.wait()
-        if not mi_result or won.is_set():
-            return
-        try:
-            _, sound = mi_result[0]
-            sound = {**sound, "source_type": "myinstants"}
-            logger.debug("race: MI прямое → «%s»", sound["title"])
-            audio = await asyncio.to_thread(importer.download_audio, _mi_session(), sound["url"])
-            if try_claim(audio, sound):
-                logger.debug("race: MI прямое ПОБЕДИЛО «%s»", sound["title"])
-        except importer.AudioTooLargeError:
-            logger.debug("race: MI прямое: файл >20 МБ")
-        except Exception as e:
-            logger.debug("race: MI прямое упало: %s", e)
-
-    # --- Цепочка 3: MyInstants + yt-dlp ---
-    async def pipeline_mi_ytdlp() -> None:
-        await mi_done.wait()
-        if not mi_result or won.is_set():
-            return
-        try:
-            _, sound = mi_result[0]
-            sound = {**sound, "source_type": "myinstants"}
-            logger.debug("race: yt-dlp → «%s»", sound["title"])
-            audio = await _download_via_ytdlp(sound["url"])
-            if try_claim(audio, sound):
-                logger.debug("race: yt-dlp ПОБЕДИЛ «%s»", sound["title"])
-        except Exception as e:
-            logger.debug("race: yt-dlp упал: %s", e)
-
-    # --- Запуск ---
-    mi_task = asyncio.create_task(do_mi_search())
-    pipe_tasks = [
-        asyncio.create_task(pipeline_tiktok()),
-        asyncio.create_task(pipeline_mi_direct()),
-        asyncio.create_task(pipeline_mi_ytdlp()),
-    ]
-
-    # Ждём первого победителя ИЛИ пока все не завершатся
-    remaining: set[asyncio.Task] = set(pipe_tasks)
-    deadline = asyncio.get_running_loop().time() + timeout
-
-    while remaining and not won.is_set():
-        time_left = deadline - asyncio.get_running_loop().time()
-        if time_left <= 0:
-            break
-        done, remaining = await asyncio.wait(
-            remaining,
-            timeout=time_left,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-    # Отменяем всё лишнее
-    mi_task.cancel()
-    for t in pipe_tasks:
-        t.cancel()
-    await asyncio.gather(mi_task, *pipe_tasks, return_exceptions=True)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     return winner[0] if winner else None
 
@@ -286,7 +346,7 @@ async def _convert_and_publish(
     """
     title = sound.get("title", "")
     source_type = sound.get("source_type", "myinstants")
-    source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
+    source_label = "TikTok" if source_type.startswith("tiktok") else "MyInstants"
 
     try:
         bot_text, transcription_error, ogg_bytes, content_hash = (
@@ -512,7 +572,12 @@ async def handle_loads_search(message: Message, query: str) -> None:
     audio_bytes, sound = result
     title = sound.get("title", query)
     source_type = sound.get("source_type", "myinstants")
-    source_label = "TikTok (ssstik)" if source_type == "tiktok" else "MyInstants"
+    if source_type == "tiktok_ssstik":
+        source_label = "TikTok (SSSTik)"
+    elif source_type.startswith("tiktok"):
+        source_label = "TikTok"
+    else:
+        source_label = "MyInstants"
 
     # Проверка дубликата по названию
     existing = mif_core.find_duplicate_by_title(title)
@@ -578,7 +643,7 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
     audio_bytes, sound = result
     title = sound.get("title", query_text)
     source_type = sound.get("source_type", "myinstants")
-    source_label = "TikTok" if source_type == "tiktok" else "MyInstants"
+    source_label = "TikTok" if source_type.startswith("tiktok") else "MyInstants"
 
     await notify(i18n.t("loads_winner", language, source=source_label, title=title))
 
