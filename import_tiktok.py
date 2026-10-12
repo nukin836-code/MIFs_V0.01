@@ -43,6 +43,35 @@ SSSTIK_HEADERS = {
 }
 
 
+def _is_downloadable_tiktok_url(url: str) -> bool:
+    if "://" in url:
+        candidate = url
+    elif url.startswith("//"):
+        candidate = f"https:{url}"
+    else:
+        candidate = f"https://{url}"
+    parsed = urlparse(candidate)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host in {"vt.tiktok.com", "vm.tiktok.com"}:
+        return True
+    return (host == "tiktok.com" or host.endswith(".tiktok.com")) and "/video/" in parsed.path
+
+
+def _extract_tiktok_video_links(page_html: str) -> tuple[list[str], int]:
+    soup = BeautifulSoup(page_html, "html.parser")
+    links: list[str] = []
+    seen: set[str] = set()
+    anchors = soup.find_all("a", href=True)
+    for anchor in anchors:
+        href = str(anchor["href"])
+        if "uddg=" in href:
+            href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
+        if _is_downloadable_tiktok_url(href) and href not in seen:
+            seen.add(href)
+            links.append(href)
+    return links, len(anchors)
+
+
 async def search_catalog(
     session: requests.Session,
     query: str,
@@ -71,33 +100,12 @@ async def search_catalog(
             logger.warning("❌ DDG Lite вернул статус: %s", response.status_code)
             return []
 
-        soup = BeautifulSoup(response.text, "html.parser")
         # Сохраняем порядок выдачи. set здесь ломал главный смысл этого
         # провайдера: пользовательский запрос должен идти в первый результат
         # поисковика, а не в случайную ссылку из множества.
-        video_links: list[str] = []
-        seen_links: set[str] = set()
-
-        total_links_found = 0
-        for a in soup.find_all("a", href=True):
-            total_links_found += 1
-            href = a["href"]
-
-            if "uddg=" in href:
-                try:
-                    parsed_url = parse_qs(urlparse(href).query)
-                    if "uddg" in parsed_url:
-                        href = parsed_url["uddg"][0]
-                except Exception:
-                    pass
-
-            if "tiktok.com" in href and (
-                "/video/" in href or "vt.tiktok.com" in href or "/@" in href
-            ):
-                logger.info("🎯 TikTok ссылка: %s", href)
-                if href not in seen_links:
-                    seen_links.add(href)
-                    video_links.append(href)
+        video_links, total_links_found = _extract_tiktok_video_links(response.text)
+        for href in video_links:
+            logger.info("🎯 TikTok ссылка: %s", href)
 
         logger.info(
             "📊 Просмотрено ссылок: %d. TikTok ссылок: %d",
@@ -178,9 +186,9 @@ def download_audio_via_ssstik(
 ) -> bytes:
     """Медленный, но точный путь: TikTok URL → SSSTik → прямой медиафайл.
 
-    Сначала забираем свежий скрытый токен ``tt`` со страницы SSSTik. Это
-    важно: отправка старого пустого токена периодически возвращает HTML
-    ошибки вместо ссылки на скачивание.
+    Если страница содержит скрытый ``tt``, используем его. В текущей версии
+    SSSTik поле может отсутствовать; тогда отправляем пустое значение, которое
+    сервис принимает, вместо преждевременного отказа от резервного источника.
     """
     logger.info("📥 [SSSTIK DOWNLOAD START] Ссылка: %s", tiktok_page_url)
 
@@ -194,8 +202,6 @@ def download_audio_via_ssstik(
         "input", {"name": "tt"}
     )
     token = str(token_node.get("value", "")) if token_node else ""
-    if not token:
-        raise RuntimeError("SSSTik не вернул защитный токен tt")
 
     parsed = session.post(
         "https://ssstik.io/abc?url=dl",
@@ -247,6 +253,7 @@ async def search_catalog_async(
     как в прежнем пользовательском сценарии.
     """
     search_query = f"tiktok {query}"
+    links: list[str] = []
     try:
         async with session.post(
             "https://lite.duckduckgo.com/lite/",
@@ -254,28 +261,37 @@ async def search_catalog_async(
             headers=SEARCH_HEADERS,
             timeout=aiohttp.ClientTimeout(total=8),
         ) as response:
-            if response.status != 200:
-                logger.info("DDG Lite ответил HTTP %s", response.status)
-                return []
-            page_html = await response.text()
+            if response.status == 200:
+                page_html = await response.text()
+                links, _ = _extract_tiktok_video_links(page_html)
+            else:
+                logger.info("DDG Lite POST ответил HTTP %s; пробую GET", response.status)
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        logger.debug("DDG Lite поиск не удался для %r", query, exc_info=True)
-        return []
+        logger.debug("DDG Lite POST не удался для %r; пробую GET", query)
 
-    soup = BeautifulSoup(page_html, "html.parser")
-    links: list[str] = []
-    seen: set[str] = set()
-    for anchor in soup.find_all("a", href=True):
-        href = str(anchor["href"])
-        if "uddg=" in href:
-            href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
-        if (
-            "tiktok.com" in href.lower()
-            and ("/video/" in href or "vt.tiktok.com" in href or "/@" in href)
-            and href not in seen
-        ):
-            seen.add(href)
-            links.append(href)
+    # Некоторые ответы POST содержат только TikTok-теги вместо видео, а
+    # DuckDuckGo Lite может вернуть поисковую капчу. GET оставляем как
+    # отменяемый резерв и принимаем только прямые ссылки на ролики.
+    if not links:
+        try:
+            async with session.get(
+                "https://lite.duckduckgo.com/lite/",
+                params={"q": search_query, "kl": ""},
+                headers=SEARCH_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as response:
+                if response.status != 200:
+                    logger.info("DDG Lite GET ответил HTTP %s", response.status)
+                    return []
+                page_html = await response.text()
+                links, _ = _extract_tiktok_video_links(page_html)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            logger.debug("DDG Lite GET поиск не удался для %r", query, exc_info=True)
+            return []
+
+    if not links:
+        logger.info("DDG Lite не вернул прямых TikTok-видео для %r", query)
+        return []
 
     results: list[tuple[int, dict[str, str]]] = []
     for index, link in enumerate(links[:max_results]):
@@ -329,7 +345,7 @@ async def download_audio_via_ssstik_async(
     session: aiohttp.ClientSession,
     tiktok_page_url: str,
 ) -> bytes:
-    """Точный резервный путь через SSSTik с динамическим токеном ``tt``.
+    """Точный резервный путь через SSSTik с необязательным токеном ``tt``.
 
     Использует cancellable aiohttp-запросы, поэтому при победе другого
     источника незавершённые SSSTik-запросы закрываются вместе с задачей.
@@ -346,8 +362,6 @@ async def download_audio_via_ssstik_async(
         "input", {"name": "tt"}
     )
     token = str(token_node.get("value", "")) if token_node else ""
-    if not token:
-        raise RuntimeError("SSSTik не вернул защитный токен tt")
 
     async with session.post(
         "https://ssstik.io/abc?url=dl",
