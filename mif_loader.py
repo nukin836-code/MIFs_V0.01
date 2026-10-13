@@ -6,8 +6,8 @@
 первая ветка, которая вернула аудиобайты.
 
 Цепочки:
-  1. TikTok DDG → TikWM → yt-dlp
-  2. TikTok DDG → SSSTik (точный резервный downloader)
+  1. TikTok DDG/Bing Video → TikWM → yt-dlp
+  2. TikTok DDG/Bing Video → SSSTik (точный резервный downloader)
   3. MyInstants API → прямое скачивание
   4. MyInstants API → yt-dlp
 
@@ -175,8 +175,8 @@ async def _race_all_sources(
     При победе отменяет HTTP-запросы и завершает yt-dlp процессы.
 
     Цепочки:
-      1. TikTok DDG → TikWM → yt-dlp
-      2. TikTok DDG → SSSTik (точный резервный downloader)
+      1. TikTok DDG/Bing Video → TikWM → yt-dlp
+      2. TikTok DDG/Bing Video → SSSTik (точный резервный downloader)
       3. MyInstants API → прямое скачивание
       4. MyInstants API → yt-dlp
     Каждый поиск выполняется один раз и отдаёт кандидата двум загрузчикам.

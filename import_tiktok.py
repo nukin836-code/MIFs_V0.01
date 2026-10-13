@@ -1,5 +1,7 @@
 import asyncio
+import html as html_lib
 import logging
+import re
 from urllib.parse import urlparse, parse_qs
 
 import aiohttp
@@ -28,6 +30,19 @@ SEARCH_HEADERS = {
     ),
     "Origin": "https://lite.duckduckgo.com",
     "Referer": "https://lite.duckduckgo.com/",
+}
+
+BING_SEARCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 SSSTIK_HEADERS = {
@@ -70,6 +85,23 @@ def _extract_tiktok_video_links(page_html: str) -> tuple[list[str], int]:
             seen.add(href)
             links.append(href)
     return links, len(anchors)
+
+
+def _extract_bing_video_search_links(page_html: str) -> list[str]:
+    """Находит прямые TikTok URLs в Bing Video result metadata."""
+    decoded_html = html_lib.unescape(page_html)
+    pattern = re.compile(
+        r'https?://(?:www\.)?tiktok\.com/@[^/"\\<>\s]+/video/\d+',
+        re.IGNORECASE,
+    )
+    links: list[str] = []
+    seen: set[str] = set()
+    for match in pattern.finditer(decoded_html):
+        url = match.group(0)
+        if _is_downloadable_tiktok_url(url) and url not in seen:
+            seen.add(url)
+            links.append(url)
+    return links
 
 
 async def search_catalog(
@@ -247,10 +279,10 @@ async def search_catalog_async(
     min_score: int = 0,
     max_results: int = 5,
 ) -> list[tuple[int, dict[str, str]]]:
-    """Отменяемый asyncio-вариант DDG Lite поиска TikTok.
+    """Отменяемый поиск: DuckDuckGo Lite, затем Bing Video как резерв.
 
-    Сохраняет точный порядок выдачи: первый TikTok URL — главный кандидат,
-    как в прежнем пользовательском сценарии.
+    Сохраняет порядок выдачи и принимает только прямые ссылки на ролики,
+    которые можно передать TikWM/SSSTik.
     """
     search_query = f"tiktok {query}"
     links: list[str] = []
@@ -282,15 +314,35 @@ async def search_catalog_async(
             ) as response:
                 if response.status != 200:
                     logger.info("DDG Lite GET ответил HTTP %s", response.status)
+                else:
+                    page_html = await response.text()
+                    links, _ = _extract_tiktok_video_links(page_html)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            logger.debug("DDG Lite GET не удался для %r; пробую Bing Video", query)
+
+    if not links:
+        logger.info(
+            "DDG Lite не вернул прямых TikTok-видео для %r; пробую Bing Video",
+            query,
+        )
+        try:
+            async with session.get(
+                "https://www.bing.com/videos/search",
+                params={"q": f"{query} TikTok"},
+                headers=BING_SEARCH_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    logger.info("Bing Video ответил HTTP %s", response.status)
                     return []
                 page_html = await response.text()
-                links, _ = _extract_tiktok_video_links(page_html)
+                links = _extract_bing_video_search_links(page_html)
         except (aiohttp.ClientError, asyncio.TimeoutError):
-            logger.debug("DDG Lite GET поиск не удался для %r", query, exc_info=True)
+            logger.debug("Bing Video поиск не удался для %r", query, exc_info=True)
             return []
 
     if not links:
-        logger.info("DDG Lite не вернул прямых TikTok-видео для %r", query)
+        logger.info("DDG Lite и Bing Video не нашли прямых TikTok-видео для %r", query)
         return []
 
     results: list[tuple[int, dict[str, str]]] = []
