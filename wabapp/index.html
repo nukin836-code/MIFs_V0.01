@@ -448,6 +448,8 @@
   var player = document.getElementById('player');
   var playerTitle = document.getElementById('playerTitle');
   var languageSelect = document.getElementById('languageSelect');
+  var soundFetchId = 0;
+  var soundFetchController = null;
 
   // --- Запросы к backend'у ---------------------------------------------
 
@@ -541,12 +543,20 @@
   }
 
   function fetchSounds(reset){
+    if (!reset && state.loading) return;
+    var requestId = ++soundFetchId;
+
     if (reset){
+      if (soundFetchController) soundFetchController.abort();
       state.offset = 0;
       state.items = [];
       renderSkeleton();
     }
     state.loading = true;
+    var controller = typeof AbortController !== 'undefined'
+      ? new AbortController()
+      : null;
+    soundFetchController = controller;
 
     var params = new URLSearchParams({
       q: state.query,
@@ -554,17 +564,23 @@
       limit: String(state.limit),
       offset: String(state.offset)
     });
-    apiFetch('/api/sounds?' + params.toString())
+    var requestOptions = controller ? {signal: controller.signal} : {};
+    apiFetch('/api/sounds?' + params.toString(), requestOptions)
       .then(function(data){
+        if (requestId !== soundFetchId) return;
         state.total = data.total;
         state.items = reset ? data.items : state.items.concat(data.items);
         renderList();
       })
       .catch(function(error){
+        if (requestId !== soundFetchId || error.name === 'AbortError') return;
         renderMessage(tr('loadError') + error.message, true);
       })
       .finally(function(){
-        state.loading = false;
+        if (requestId === soundFetchId){
+          state.loading = false;
+          soundFetchController = null;
+        }
       });
   }
 
@@ -747,6 +763,7 @@
   });
 
   loadMoreBtn.addEventListener('click', function(){
+    if (state.loading || state.items.length >= state.total) return;
     state.offset += state.limit;
     fetchSounds(false);
   });

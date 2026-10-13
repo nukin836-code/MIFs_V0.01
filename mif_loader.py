@@ -70,11 +70,17 @@ DEBOUNCE_DELAY_SECONDS = 0.3
 class _UserLookupState:
     def __init__(self) -> None:
         self.debounce_task: asyncio.Task | None = None
+        self.debounce_query: str | None = None
         self.in_flight: bool = False
+        self.in_flight_query: str | None = None
         self.latest_pending_query: str | None = None
 
 
 _user_lookup_states: dict[int, _UserLookupState] = {}
+
+
+def _lookup_key(query_text: str) -> str:
+    return " ".join(query_text.casefold().split())
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +95,24 @@ def _mi_session() -> requests.Session:
 
 def schedule_background_lookup(bot: Bot, requester_id: int, query_text: str) -> None:
     state = _user_lookup_states.setdefault(requester_id, _UserLookupState())
+    query_key = _lookup_key(query_text)
+
     if state.in_flight:
+        if query_key == _lookup_key(state.in_flight_query or ""):
+            # Пользователь вернулся к уже выполняемому запросу: отбросить
+            # более старый pending-запрос, а не запускать повтор того же звука.
+            state.latest_pending_query = None
+            return
+        if query_key == _lookup_key(state.latest_pending_query or ""):
+            return
         state.latest_pending_query = query_text
         return
+
     if state.debounce_task is not None and not state.debounce_task.done():
+        if query_key == _lookup_key(state.debounce_query or ""):
+            return
         state.debounce_task.cancel()
+    state.debounce_query = query_text
     state.debounce_task = asyncio.create_task(
         _debounced_lookup(bot, requester_id, query_text)
     )
@@ -107,11 +126,14 @@ async def _debounced_lookup(bot: Bot, requester_id: int, query_text: str) -> Non
 
     state = _user_lookup_states[requester_id]
     state.debounce_task = None
+    state.debounce_query = None
     state.in_flight = True
+    state.in_flight_query = query_text
     try:
         await background_internet_lookup(bot, requester_id, query_text)
     finally:
         state.in_flight = False
+        state.in_flight_query = None
 
     next_query = state.latest_pending_query
     state.latest_pending_query = None
@@ -168,10 +190,10 @@ async def _race_all_sources(
     query: str,
     *,
     timeout: float = 75.0,
-) -> tuple[bytes, dict[str, str]] | None:
+) -> tuple[bytes | None, dict[str, Any]] | None:
     """
     Одновременно запускает поиски и четыре загрузчика.
-    Возвращает (audio_bytes, sound_info) первой успешной цепочки.
+    Возвращает байты победителя или уже сохранённую запись без повторной загрузки.
     При победе отменяет HTTP-запросы и завершает yt-dlp процессы.
 
     Цепочки:
@@ -187,13 +209,26 @@ async def _race_all_sources(
     tiktok_done = asyncio.Event()
 
     won = asyncio.Event()
-    winner: list[tuple[bytes, dict]] = []
+    winner: list[tuple[bytes | None, dict[str, Any]]] = []
 
-    def try_claim(audio: bytes, sound: dict) -> bool:
+    def try_claim(audio: bytes | None, sound: dict[str, Any]) -> bool:
         if won.is_set():
             return False
         won.set()
         winner.append((audio, sound))
+        return True
+
+    def claim_existing(sound: dict[str, Any]) -> bool:
+        source_url = str(sound.get("url", ""))
+        title = str(sound.get("title", ""))
+        existing = (
+            mif_core.find_duplicate_by_source_url(source_url)
+            or mif_core.find_duplicate_by_title(title)
+        )
+        if existing is None:
+            return False
+        try_claim(None, {**sound, "_existing_entry": existing})
+        logger.info("race: «%s» уже есть в базе; внешнюю загрузку пропущу", title)
         return True
 
     async with aiohttp.ClientSession(
@@ -240,6 +275,8 @@ async def _race_all_sources(
                 if found is None:
                     return
                 sound = {**found, "source_type": "tiktok"}
+                if claim_existing(sound):
+                    return
                 try:
                     audio = await import_tiktok.download_audio_via_tikwm_async(
                         http, sound["url"]
@@ -263,6 +300,8 @@ async def _race_all_sources(
                 if found is None or won.is_set():
                     return
                 sound = {**found, "source_type": "tiktok_ssstik"}
+                if claim_existing(sound):
+                    return
                 logger.info("race: SSSTik начал загрузку «%s»", sound["title"])
                 audio = await import_tiktok.download_audio_via_ssstik_async(
                     http, sound["url"]
@@ -279,6 +318,8 @@ async def _race_all_sources(
             try:
                 _, found = mi_result[0]
                 sound = {**found, "source_type": "myinstants"}
+                if claim_existing(sound):
+                    return
                 audio = await importer.download_audio_async(http, sound["url"])
                 if try_claim(audio, sound):
                     logger.info("race: MI прямое ПОБЕДИЛО «%s»", sound["title"])
@@ -294,6 +335,8 @@ async def _race_all_sources(
             try:
                 _, found = mi_result[0]
                 sound = {**found, "source_type": "myinstants"}
+                if claim_existing(sound):
+                    return
                 audio = await _download_via_ytdlp(sound["url"])
                 if try_claim(audio, sound):
                     logger.info("race: MI yt-dlp ПОБЕДИЛ «%s»", sound["title"])
@@ -402,6 +445,13 @@ async def import_one_sound(
     Прямое скачивание → yt-dlp как резерв.
     """
     title = sound["title"]
+    existing = (
+        mif_core.find_duplicate_by_source_url(sound.get("url", ""))
+        or mif_core.find_duplicate_by_title(title)
+    )
+    if existing is not None:
+        logger.info("Пропуск скачивания: «%s» уже сохранён", title)
+        return "duplicate", existing
 
     if notify_func:
         await notify_func(i18n.t("download", language))
@@ -475,7 +525,10 @@ async def run_loads_loop(bot: Bot, chat_id: int, target_count: int | None) -> No
                     target_count is not None and loader_state.added_count >= target_count
                 ):
                     break
-                if mif_core.find_duplicate_by_title(sound["title"]) is not None:
+                if (
+                    mif_core.find_duplicate_by_title(sound["title"]) is not None
+                    or mif_core.find_duplicate_by_source_url(sound["url"]) is not None
+                ):
                     await asyncio.sleep(LOADS_STEP_DELAY_SECONDS)
                     continue
 
@@ -539,6 +592,19 @@ async def handle_loads_stop(message: Message) -> None:
     )
 
 
+async def _send_existing_sound(message: Message, mif: dict[str, Any]) -> None:
+    file_id = mif.get("file_id")
+    if not file_id:
+        logger.error("У существующего MIF %s отсутствует file_id", mif.get("id"))
+        return
+    title = str(mif.get("title") or "")
+    file_type = mif.get("file_type", mif.get("media_type", "voice"))
+    if file_type == "audio":
+        await message.answer_audio(audio=file_id, caption=title or None)
+    else:
+        await message.answer_voice(voice=file_id, caption=title or None)
+
+
 # ---------------------------------------------------------------------------
 # /loadsSearch — ручной поиск с гонкой трёх источников
 # ---------------------------------------------------------------------------
@@ -570,6 +636,22 @@ async def handle_loads_search(message: Message, query: str) -> None:
         return
 
     audio_bytes, sound = result
+    known_entry = sound.get("_existing_entry")
+    if known_entry is not None:
+        await upd(
+            i18n.t(
+                "loads_duplicate_title",
+                language,
+                title=known_entry.get("title", sound.get("title", query)),
+            )
+        )
+        await _send_existing_sound(message, known_entry)
+        return
+    if audio_bytes is None:
+        logger.error("Поиск «%s» вернул запись без аудио и без существующего MIF", query)
+        await upd(i18n.t("loads_publish_error", language))
+        return
+
     title = sound.get("title", query)
     source_type = sound.get("source_type", "myinstants")
     if source_type == "tiktok_ssstik":
@@ -583,7 +665,7 @@ async def handle_loads_search(message: Message, query: str) -> None:
     existing = mif_core.find_duplicate_by_title(title)
     if existing:
         await upd(i18n.t("loads_duplicate_title", language, title=title))
-        await message.answer_voice(voice=existing["file_id"])
+        await _send_existing_sound(message, existing)
         return
 
     await upd(i18n.t("loads_winner", language, source=source_label, title=title))
@@ -592,7 +674,7 @@ async def handle_loads_search(message: Message, query: str) -> None:
 
     if status == "duplicate" and entry:
         await upd(i18n.t("loads_duplicate_hash", language, title=entry.get("title")))
-        await message.answer_voice(voice=entry["file_id"])
+        await _send_existing_sound(message, entry)
         return
 
     if status == "added" and entry:
@@ -641,6 +723,15 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
         return
 
     audio_bytes, sound = result
+    known_entry = sound.get("_existing_entry")
+    if known_entry is not None:
+        await notify(i18n.t("auto_search_existing", language))
+        return
+    if audio_bytes is None:
+        logger.error("Фоновый поиск «%s» вернул запись без аудио", query_text)
+        await notify(i18n.t("auto_search_none", language, query=query_text))
+        return
+
     title = sound.get("title", query_text)
     source_type = sound.get("source_type", "myinstants")
     source_label = "TikTok" if source_type.startswith("tiktok") else "MyInstants"

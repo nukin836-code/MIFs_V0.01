@@ -23,6 +23,7 @@ import tempfile
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
+from urllib.parse import urlsplit
 
 import speech_recognition as sr
 from aiogram import Bot
@@ -180,6 +181,31 @@ def find_duplicate_by_title(title: str) -> dict[str, Any] | None:
     title_key = title.strip().lower()
     for mif in MIFS_DATABASE:
         if str(mif.get("title", "")).strip().lower() == title_key:
+            return mif
+    return None
+
+
+def _source_url_key(source_url: str) -> str:
+    value = source_url.strip()
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").casefold().removeprefix("www.")
+        path = parsed.path.rstrip("/").casefold()
+        if hostname:
+            return f"{hostname}{path}"
+    except ValueError:
+        pass
+    return value.rstrip("/").casefold()
+
+
+def find_duplicate_by_source_url(source_url: str) -> dict[str, Any] | None:
+    """Ищет сохранённый звук по адресу источника, игнорируя tracking query."""
+    source_key = _source_url_key(source_url)
+    if not source_key:
+        return None
+    for mif in MIFS_DATABASE:
+        stored_url = str(mif.get("source_url", "")).strip()
+        if stored_url and _source_url_key(stored_url) == source_key:
             return mif
     return None
 
@@ -362,25 +388,44 @@ def find_matching_mifs(query_text: str) -> tuple[list[dict[str, Any]], float]:
         # искать), поэтому best_score = 100.0, а не 0.0.
         return list(MIFS_DATABASE[:MAX_INLINE_RESULTS]), 100.0
 
-    translated = translate_to_english(query_text)
-    translated_tokens = (
-        [token for token in translated.lower().strip().split() if token] if translated else []
-    )
-
-    scored: list[tuple[float, dict[str, Any]]] = []
+    scored_by_record: dict[int, tuple[float, dict[str, Any]]] = {}
     for mif in MIFS_DATABASE:
         user_tags = str(mif.get("user_tags", mif.get("tags", ""))).lower()
         bot_tags = str(mif.get("bot_tags", mif.get("bot_description", ""))).lower()
 
         score = _score_mif_tokens(tokens, user_tags, bot_tags)
-        if translated_tokens:
-            translated_score = _score_mif_tokens(translated_tokens, user_tags, bot_tags)
-            if translated_score is not None and (score is None or translated_score > score):
-                score = translated_score
-        if score is None:
-            continue
-        scored.append((score, mif))
+        if score is not None:
+            scored_by_record[id(mif)] = (score, mif)
 
+    normalized_query = " ".join(query_text.casefold().split())
+    has_exact_local_match = any(
+        normalized_query
+        in " ".join(
+            str(mif.get(field, ""))
+            for field in ("title", "user_tags", "tags")
+        ).casefold()
+        for mif in MIFS_DATABASE
+    )
+
+    # Exact local matches need no network translation. This keeps the inline
+    # results fast and avoids unnecessary rate-limited translator requests
+    # while the user is typing.
+    translated = None if has_exact_local_match else translate_to_english(query_text)
+    translated_tokens = (
+        [token for token in translated.lower().strip().split() if token] if translated else []
+    )
+    if translated_tokens:
+        for mif in MIFS_DATABASE:
+            user_tags = str(mif.get("user_tags", mif.get("tags", ""))).lower()
+            bot_tags = str(mif.get("bot_tags", mif.get("bot_description", ""))).lower()
+            translated_score = _score_mif_tokens(translated_tokens, user_tags, bot_tags)
+            current = scored_by_record.get(id(mif))
+            if translated_score is not None and (
+                current is None or translated_score > current[0]
+            ):
+                scored_by_record[id(mif)] = (translated_score, mif)
+
+    scored = list(scored_by_record.values())
     scored.sort(key=lambda pair: pair[0], reverse=True)
     best_score = scored[0][0] if scored else 0.0
     return [mif for _, mif in scored[:MAX_INLINE_RESULTS]], best_score

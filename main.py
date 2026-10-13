@@ -421,7 +421,12 @@ async def search_mifs(query: InlineQuery) -> None:
         matches = db_manager.get_personal_menu(query.from_user.id)
         best_score = 100.0
     else:
-        matches, best_score = mif_core.find_matching_mifs(query_text)
+        # Поиск может перевести кириллический запрос через внешний сервис.
+        # Не блокируем этим event loop бота — иначе Telegram inline-подсказки
+        # и остальные обработчики начинают отвечать с задержкой.
+        matches, best_score = await asyncio.to_thread(
+            mif_core.find_matching_mifs, query_text
+        )
 
     results = []
     for mif in matches:
@@ -446,7 +451,7 @@ async def search_mifs(query: InlineQuery) -> None:
                 )
             )
 
-    await query.answer(results=results, cache_time=1, is_personal=True)
+    await query.answer(results=results, cache_time=0, is_personal=True)
 
     if query_text and best_score < mif_core.FUZZY_MATCH_THRESHOLD:
         mif_loader.schedule_background_lookup(query.bot, query.from_user.id, query_text)

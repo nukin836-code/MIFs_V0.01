@@ -645,6 +645,15 @@ async def import_sound(
     """Batch-версия того же пути, что mif_loader.import_one_sound — обе идут
     через mif_core.prepare_audio_from_bytes / mif_core.publish_voice_mif."""
     title = sound["title"]
+    title_key = title.strip().casefold()
+    if (
+        title_key in {stored.strip().casefold() for stored in existing_titles}
+        or mif_core.find_duplicate_by_title(title) is not None
+        or mif_core.find_duplicate_by_source_url(sound.get("url", "")) is not None
+    ):
+        logger.info("Пропуск скачивания: «%s» уже сохранён", title)
+        existing_titles.add(title_key)
+        return False
 
     try:
         audio_bytes = await asyncio.to_thread(download_audio, session, sound["url"])

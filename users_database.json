@@ -1,8 +1,15 @@
 {
   "1297417116": {
     "favorites": [],
-    "history": {},
-    "used_sound_ids": [],
+    "history": {
+      "13": {
+        "count": 1,
+        "last_used": "2026-10-13T16:36:17.412091+00:00"
+      }
+    },
+    "used_sound_ids": [
+      "13"
+    ],
     "language": "ru"
   }
 }
