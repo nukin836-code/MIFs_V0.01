@@ -228,6 +228,26 @@ def _extract_bing_video_search_links(page_html: str) -> list[str]:
     return links
 
 
+async def _search_bing_video_links(
+    session: aiohttp.ClientSession,
+    search_query: str,
+) -> list[str]:
+    try:
+        async with session.get(
+            "https://www.bing.com/videos/search",
+            params={"q": search_query},
+            headers=BING_SEARCH_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as response:
+            if response.status != 200:
+                logger.info("Bing Video ответил HTTP %s", response.status)
+                return []
+            return _extract_bing_video_search_links(await response.text())
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        logger.debug("Bing Video поиск не удался для %r", search_query, exc_info=True)
+        return []
+
+
 async def search_catalog(
     session: requests.Session,
     query: str,
@@ -446,27 +466,28 @@ async def search_catalog_async(
 
     if not candidates:
         logger.info(
-            "DDG Lite не вернул прямых TikTok-видео для %r; пробую Bing Video",
+            "DDG Lite не вернул прямых TikTok-видео для %r; "
+            "пробую варианты запроса в Bing Video",
             query,
         )
-        try:
-            async with session.get(
-                "https://www.bing.com/videos/search",
-                params={"q": f"{query} TikTok"},
-                headers=BING_SEARCH_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as response:
-                if response.status != 200:
-                    logger.info("Bing Video ответил HTTP %s", response.status)
-                    return []
-                page_html = await response.text()
-                candidates = [
-                    {"url": link, "title": "", "snippet": ""}
-                    for link in _extract_bing_video_search_links(page_html)
-                ]
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            logger.debug("Bing Video поиск не удался для %r", query, exc_info=True)
-            return []
+        bing_queries = [
+            f'"{query}" TikTok',
+            f'тикток звук "{query}"',
+            f'TikTok sound "{query}"',
+        ]
+        result_sets = await asyncio.gather(
+            *(_search_bing_video_links(session, term) for term in bing_queries)
+        )
+        seen: set[str] = set()
+        for index in range(max((len(items) for items in result_sets), default=0)):
+            for items in result_sets:
+                if index >= len(items):
+                    continue
+                link = items[index]
+                if link in seen:
+                    continue
+                seen.add(link)
+                candidates.append({"url": link, "title": "", "snippet": ""})
 
     if not candidates:
         logger.info("DDG Lite и Bing Video не нашли прямых TikTok-видео для %r", query)

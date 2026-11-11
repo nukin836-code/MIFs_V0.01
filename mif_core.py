@@ -317,8 +317,12 @@ def translate_to_english(query: str) -> str | None:
             logger.info("Перевёл запрос «%s» → «%s»", query, translated)
             return translated.strip()
         return None
-    except Exception:
-        logger.warning("Не удалось перевести запрос «%s» на английский", query, exc_info=True)
+    except Exception as error:
+        logger.info(
+            "Перевод запроса «%s» недоступен (%s); продолжаю с исходным текстом",
+            query,
+            type(error).__name__,
+        )
         return None
 
 
