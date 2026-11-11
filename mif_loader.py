@@ -45,9 +45,79 @@ logger = logging.getLogger("mif-bot.loader")
 
 LOADS_ADMIN_ID = int(os.getenv("LOADS_ADMIN_ID", "1297417116"))
 LOADS_STEP_DELAY_SECONDS = 5.0
+TIKTOK_SEARCH_CANDIDATES = 5
+TIKTOK_MAX_AUDIO_CHECKS = 3
+TIKTOK_TRANSCRIPT_MATCH_THRESHOLD = 60.0
+TIKTOK_MUSIC_MATCH_THRESHOLD = 75.0
+TIKTOK_CAPTION_FALLBACK_THRESHOLD = 75.0
 
 LOADS_SEARCH_RE = re.compile(r'^/loadsSearch\s+"?([^"]+?)"?\s*$')
 LOADS_COUNT_RE  = re.compile(r"^/loads(\d+)$")
+
+
+_TIKTOK_QUERY_STOPWORDS = {
+    "а", "и", "но", "в", "во", "на", "по", "за", "с", "со", "к", "ко",
+    "у", "из", "от", "для", "это", "я", "ты", "он", "она", "они", "мой",
+    "моя", "мое", "мои", "твой", "твоя", "что", "как", "ли", "же",
+}
+
+
+def _tiktok_transcript_match_score(query: str, transcript: str) -> float:
+    """Сравнивает запрос с распознанной речью, требуя совпадения нескольких слов."""
+    query_tokens = re.findall(r"[a-zа-яёіїєґ0-9]+", query.casefold())
+    transcript_tokens = re.findall(r"[a-zа-яёіїєґ0-9]+", transcript.casefold())
+    if not query_tokens or not transcript_tokens:
+        return 0.0
+
+    content_tokens = [
+        token for token in query_tokens
+        if len(token) > 2 and token not in _TIKTOK_QUERY_STOPWORDS
+    ] or query_tokens
+    matched = 0
+    for token in content_tokens:
+        best = max(
+            (mif_core.fuzzy_match_score(token, candidate) for candidate in transcript_tokens),
+            default=0.0,
+        )
+        if best >= 78.0:
+            matched += 1
+
+    coverage = matched / len(content_tokens)
+    required_matches = (
+        len(content_tokens)
+        if len(content_tokens) <= 2
+        else max(2, (len(content_tokens) * 3 + 4) // 5)
+    )
+    score = min(
+        mif_core.fuzzy_match_score(" ".join(content_tokens), " ".join(transcript_tokens)),
+        coverage * 100.0,
+    )
+    if matched < required_matches:
+        return min(score, TIKTOK_TRANSCRIPT_MATCH_THRESHOLD - 0.1)
+    return score
+
+
+def _tiktok_caption_score(sound: dict[str, Any]) -> float:
+    try:
+        return float(sound.get("_caption_score", sound.get("caption_score", 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _tiktok_music_score(sound: dict[str, Any]) -> float:
+    try:
+        return float(sound.get("music_score", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _tiktok_speech_not_detected(
+    prepared: tuple[str, str | None, bytes | None, str | None],
+) -> bool:
+    return (
+        not prepared[0].strip()
+        and prepared[1] == "Речь в аудиофайле не распознана."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -221,10 +291,16 @@ async def _race_all_sources(
     def claim_existing(sound: dict[str, Any]) -> bool:
         source_url = str(sound.get("url", ""))
         title = str(sound.get("title", ""))
-        existing = (
-            mif_core.find_duplicate_by_source_url(source_url)
-            or mif_core.find_duplicate_by_title(title)
-        )
+        if str(sound.get("source_type", "")).startswith("tiktok"):
+            existing = (
+                sound.get("_existing_entry")
+                or mif_core.find_duplicate_by_source_url(source_url)
+            )
+        else:
+            existing = (
+                mif_core.find_duplicate_by_source_url(source_url)
+                or mif_core.find_duplicate_by_title(title)
+            )
         if existing is None:
             return False
         try_claim(None, {**sound, "_existing_entry": existing})
@@ -255,7 +331,7 @@ async def _race_all_sources(
                     http,
                     query,
                     min_score=int(mif_core.FUZZY_MATCH_FLOOR),
-                    max_results=1,
+                    max_results=TIKTOK_SEARCH_CANDIDATES,
                 )
                 tiktok_result.extend(results)
             except Exception as error:
@@ -263,11 +339,54 @@ async def _race_all_sources(
             finally:
                 tiktok_done.set()
 
-        async def tiktok_candidate() -> dict[str, str] | None:
+        async def tiktok_candidate() -> dict[str, Any] | None:
             await tiktok_done.wait()
             if won.is_set() or not tiktok_result:
                 return None
-            return tiktok_result[0][1]
+            verified_existing: list[dict[str, Any]] = []
+            fresh_candidates: list[dict[str, Any]] = []
+            caption_fallbacks: list[dict[str, Any]] = []
+            for _, found in tiktok_result:
+                sound: dict[str, Any] = {
+                    **found,
+                    "source_type": "tiktok",
+                    "_search_query": query,
+                }
+                existing = mif_core.find_duplicate_by_source_url(
+                    str(sound.get("url", ""))
+                )
+                if existing:
+                    transcript = str(existing.get("bot_description") or "").strip()
+                    if transcript:
+                        match_score = _tiktok_transcript_match_score(query, transcript)
+                        if match_score < TIKTOK_TRANSCRIPT_MATCH_THRESHOLD:
+                            logger.info(
+                                "race: пропускаю сохранённый TikTok-ролик «%s»: "
+                                "транскрипт не совпал (%.1f)",
+                                sound.get("title", query),
+                                match_score,
+                            )
+                            continue
+                        sound["_existing_entry"] = existing
+                        sound["_audio_match_score"] = match_score
+                        verified_existing.append(sound)
+                    elif _tiktok_caption_score(sound) >= TIKTOK_CAPTION_FALLBACK_THRESHOLD:
+                        sound["_existing_entry"] = existing
+                        caption_fallbacks.append(sound)
+                    else:
+                        logger.info(
+                            "race: пропускаю старый TikTok-ролик «%s»: "
+                            "нет транскрипта и подпись недостаточно точная",
+                            sound.get("title", query),
+                        )
+                else:
+                    fresh_candidates.append(sound)
+
+            candidates = verified_existing + fresh_candidates + caption_fallbacks
+            if not candidates:
+                return None
+            candidates[0]["_tiktok_candidates"] = candidates
+            return candidates[0]
 
         async def pipeline_tiktok_fast() -> None:
             try:
@@ -374,6 +493,263 @@ async def _race_all_sources(
     return winner[0] if winner else None
 
 
+async def _download_tiktok_alternate(
+    sound: dict[str, Any],
+) -> tuple[bytes | None, str | None]:
+    """Скачивает следующий TikTok-кандидат теми же параллельными загрузчиками."""
+    url = str(sound.get("url", ""))
+    if not url:
+        return None, None
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=75),
+        connector=aiohttp.TCPConnector(limit=10),
+    ) as http:
+        async def fast_download() -> bytes:
+            try:
+                audio = await import_tiktok.download_audio_via_tikwm_async(http, url)
+                if audio:
+                    return audio
+            except Exception as error:
+                logger.debug("TikWM для альтернативного кандидата не сработал: %s", error)
+            return await _download_via_ytdlp(url)
+
+        tasks = {
+            asyncio.create_task(fast_download()): "tiktok",
+            asyncio.create_task(
+                import_tiktok.download_audio_via_ssstik_async(http, url)
+            ): "tiktok_ssstik",
+        }
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    try:
+                        audio = task.result()
+                    except Exception as error:
+                        logger.debug("Загрузка TikTok-кандидата не сработала: %s", error)
+                        continue
+                    if audio:
+                        source_type = tasks[task]
+                        for remaining in pending:
+                            remaining.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        return audio, source_type
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+    return None, None
+
+
+async def _select_relevant_tiktok_audio(
+    query: str,
+    audio_bytes: bytes,
+    sound: dict[str, Any],
+) -> tuple[
+    bytes | None,
+    dict[str, Any] | None,
+    tuple[str, str | None, bytes | None, str | None] | None,
+]:
+    """Проверяет речь победителя и при несовпадении перебирает другие ролики."""
+    if not str(sound.get("source_type", "")).startswith("tiktok"):
+        return audio_bytes, sound, None
+
+    candidates = sound.get("_tiktok_candidates", [])
+    if not isinstance(candidates, list):
+        candidates = []
+    if not candidates:
+        candidates = [sound]
+        sound["_tiktok_candidates"] = candidates
+
+    metadata_task = asyncio.create_task(
+        import_tiktok.enrich_tiktok_candidates_async(query, candidates)
+    )
+    try:
+        prepared = await mif_core.prepare_audio_from_bytes(audio_bytes)
+    except Exception:
+        metadata_task.cancel()
+        await asyncio.gather(metadata_task, return_exceptions=True)
+        raise
+    await metadata_task
+    candidates.sort(
+        key=lambda candidate: (
+            _tiktok_music_score(candidate),
+            _tiktok_caption_score(candidate),
+        ),
+        reverse=True,
+    )
+
+    current_url = str(sound.get("url", ""))
+    current_metadata = next(
+        (
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict)
+            and str(candidate.get("url", "")) == current_url
+        ),
+        None,
+    )
+    if current_metadata:
+        for key in (
+            "title",
+            "caption",
+            "caption_score",
+            "music_title",
+            "music_author",
+            "music_score",
+        ):
+            if key in current_metadata:
+                sound[key] = current_metadata[key]
+
+    transcript = prepared[0].strip()
+    current_score = _tiktok_caption_score(sound)
+    current_music_score = _tiktok_music_score(sound)
+    fallback: tuple[
+        bytes | None,
+        dict[str, Any],
+        tuple[str, str | None, bytes | None, str | None] | None,
+    ] | None = None
+
+    if transcript:
+        match_score = _tiktok_transcript_match_score(query, transcript)
+        if (
+            match_score >= TIKTOK_TRANSCRIPT_MATCH_THRESHOLD
+            or current_music_score >= TIKTOK_MUSIC_MATCH_THRESHOLD
+        ):
+            logger.info(
+                "TikTok-кандидат «%s» прошёл проверку аудио/названия дорожки "
+                "(речь %.1f, дорожка %.1f)",
+                sound.get("title", query),
+                match_score,
+                current_music_score,
+            )
+            return audio_bytes, sound, prepared
+        logger.info(
+            "TikTok-кандидат «%s» не совпал с речью запроса (%.1f)",
+            sound.get("title", query),
+            match_score,
+        )
+    elif _tiktok_speech_not_detected(prepared):
+        if current_music_score >= TIKTOK_MUSIC_MATCH_THRESHOLD:
+            logger.info(
+                "TikTok-кандидат «%s» совпал по названию звуковой дорожки (%.1f)",
+                sound.get("title", query),
+                current_music_score,
+            )
+            return audio_bytes, sound, prepared
+        if current_score >= TIKTOK_CAPTION_FALLBACK_THRESHOLD:
+            fallback = (audio_bytes, sound, prepared)
+
+    audio_checks = 1
+
+    for found in candidates:
+        if not isinstance(found, dict) or str(found.get("url", "")) == current_url:
+            continue
+        candidate: dict[str, Any] = {
+            **found,
+            "source_type": "tiktok",
+            "_search_query": query,
+            "_tiktok_candidates": candidates,
+        }
+        existing = candidate.get("_existing_entry")
+        candidate_music_score = _tiktok_music_score(candidate)
+        if existing:
+            existing_transcript = str(existing.get("bot_description") or "").strip()
+            if existing_transcript:
+                existing_score = _tiktok_transcript_match_score(query, existing_transcript)
+                if (
+                    existing_score >= TIKTOK_TRANSCRIPT_MATCH_THRESHOLD
+                    or candidate_music_score >= TIKTOK_MUSIC_MATCH_THRESHOLD
+                ):
+                    logger.info(
+                        "Использую сохранённый TikTok-кандидат «%s» "
+                        "с совпадающим аудио (%.1f)",
+                        candidate.get("title", query),
+                        existing_score,
+                    )
+                    return None, candidate, None
+            elif (
+                _tiktok_caption_score(candidate) >= TIKTOK_CAPTION_FALLBACK_THRESHOLD
+                or candidate_music_score >= TIKTOK_MUSIC_MATCH_THRESHOLD
+            ):
+                if fallback is None or _tiktok_caption_score(candidate) > _tiktok_caption_score(fallback[1]):
+                    fallback = (None, candidate, None)
+            continue
+
+        if audio_checks >= TIKTOK_MAX_AUDIO_CHECKS:
+            continue
+        audio_checks += 1
+        alternate_audio, source_type = await _download_tiktok_alternate(candidate)
+        if not alternate_audio:
+            continue
+        candidate["source_type"] = source_type or "tiktok"
+        try:
+            candidate_prepared = await mif_core.prepare_audio_from_bytes(alternate_audio)
+        except RuntimeError as error:
+            logger.warning(
+                "Не удалось подготовить альтернативный TikTok-звук «%s»: %s",
+                candidate.get("title", query),
+                error,
+            )
+            continue
+
+        candidate_transcript = candidate_prepared[0].strip()
+        if candidate_transcript:
+            match_score = _tiktok_transcript_match_score(query, candidate_transcript)
+            candidate_music_score = _tiktok_music_score(candidate)
+            if (
+                match_score >= TIKTOK_TRANSCRIPT_MATCH_THRESHOLD
+                or candidate_music_score >= TIKTOK_MUSIC_MATCH_THRESHOLD
+            ):
+                logger.info(
+                    "Выбран TikTok-кандидат «%s»: речь %.1f, дорожка %.1f",
+                    candidate.get("title", query),
+                    match_score,
+                    candidate_music_score,
+                )
+                return alternate_audio, candidate, candidate_prepared
+            logger.info(
+                "Пропускаю альтернативный TikTok-кандидат «%s»: "
+                "речь не совпала (%.1f)",
+                candidate.get("title", query),
+                match_score,
+            )
+            continue
+
+        caption_score = _tiktok_caption_score(candidate)
+        candidate_music_score = _tiktok_music_score(candidate)
+        if (
+            _tiktok_speech_not_detected(candidate_prepared)
+            and (
+                caption_score >= TIKTOK_CAPTION_FALLBACK_THRESHOLD
+                or candidate_music_score >= TIKTOK_MUSIC_MATCH_THRESHOLD
+            )
+            and (
+                fallback is None
+                or max(caption_score, candidate_music_score)
+                > max(
+                    _tiktok_caption_score(fallback[1]),
+                    _tiktok_music_score(fallback[1]),
+                )
+            )
+        ):
+            fallback = (alternate_audio, candidate, candidate_prepared)
+
+    if fallback:
+        logger.info(
+            "TikTok: точного совпадения речи нет; использую ролик с "
+            "подходящей подписью «%s»",
+            fallback[1].get("title", query),
+        )
+        return fallback
+    return None, None, None
+
+
 # ---------------------------------------------------------------------------
 # Конвертация + публикация (общая для loadsSearch и background_lookup)
 # ---------------------------------------------------------------------------
@@ -381,7 +757,9 @@ async def _race_all_sources(
 async def _convert_and_publish(
     bot: Bot,
     audio_bytes: bytes,
-    sound: dict[str, str],
+    sound: dict[str, Any],
+    *,
+    prepared_audio: tuple[str, str | None, bytes | None, str | None] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """
     Принимает сырые байты победителя гонки, конвертирует и публикует.
@@ -392,7 +770,7 @@ async def _convert_and_publish(
     source_label = "TikTok" if source_type.startswith("tiktok") else "MyInstants"
 
     try:
-        bot_text, transcription_error, ogg_bytes, content_hash = (
+        bot_text, transcription_error, ogg_bytes, content_hash = prepared_audio or (
             await mif_core.prepare_audio_from_bytes(audio_bytes)
         )
     except RuntimeError as error:
@@ -414,7 +792,17 @@ async def _convert_and_publish(
             existing_voice_file_id=None,
             base_caption=base_caption,
             title=title,
-            tags_text=title,
+            tags_text=" ".join(
+                part
+                for part in (
+                    str(sound.get("_search_query", "")).strip(),
+                    str(sound.get("caption", "")).strip(),
+                    str(sound.get("music_title", "")).strip(),
+                    str(sound.get("music_author", "")).strip(),
+                    title,
+                )
+                if part
+            ),
             bot_description=bot_text,
             content_hash=content_hash,
             source_url=sound.get("url", ""),
@@ -636,6 +1024,25 @@ async def handle_loads_search(message: Message, query: str) -> None:
         return
 
     audio_bytes, sound = result
+    prepared_audio = None
+    if audio_bytes is not None and str(sound.get("source_type", "")).startswith("tiktok"):
+        try:
+            audio_bytes, sound, prepared_audio = await _select_relevant_tiktok_audio(
+                query, audio_bytes, sound
+            )
+        except RuntimeError as error:
+            await mif_bugs.report_bug(
+                message.bot,
+                f"race: проверка TikTok не удалась для «{query}»: {error}",
+            )
+            await upd(i18n.t("loads_publish_error", language))
+            return
+
+    if sound is None:
+        logger.info("TikTok не нашёл подходящее аудио для «%s»", query)
+        await upd(i18n.t("loads_no_results", language))
+        return
+
     known_entry = sound.get("_existing_entry")
     if known_entry is not None:
         await upd(
@@ -649,7 +1056,7 @@ async def handle_loads_search(message: Message, query: str) -> None:
         return
     if audio_bytes is None:
         logger.error("Поиск «%s» вернул запись без аудио и без существующего MIF", query)
-        await upd(i18n.t("loads_publish_error", language))
+        await upd(i18n.t("loads_no_results", language))
         return
 
     title = sound.get("title", query)
@@ -661,16 +1068,21 @@ async def handle_loads_search(message: Message, query: str) -> None:
     else:
         source_label = "MyInstants"
 
-    # Проверка дубликата по названию
-    existing = mif_core.find_duplicate_by_title(title)
-    if existing:
-        await upd(i18n.t("loads_duplicate_title", language, title=title))
-        await _send_existing_sound(message, existing)
-        return
+    if not source_type.startswith("tiktok"):
+        existing = mif_core.find_duplicate_by_title(title)
+        if existing:
+            await upd(i18n.t("loads_duplicate_title", language, title=title))
+            await _send_existing_sound(message, existing)
+            return
 
     await upd(i18n.t("loads_winner", language, source=source_label, title=title))
 
-    status, entry = await _convert_and_publish(message.bot, audio_bytes, sound)
+    status, entry = await _convert_and_publish(
+        message.bot,
+        audio_bytes,
+        sound,
+        prepared_audio=prepared_audio,
+    )
 
     if status == "duplicate" and entry:
         await upd(i18n.t("loads_duplicate_hash", language, title=entry.get("title")))
@@ -723,6 +1135,25 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
         return
 
     audio_bytes, sound = result
+    prepared_audio = None
+    if audio_bytes is not None and str(sound.get("source_type", "")).startswith("tiktok"):
+        try:
+            audio_bytes, sound, prepared_audio = await _select_relevant_tiktok_audio(
+                query_text, audio_bytes, sound
+            )
+        except RuntimeError as error:
+            await mif_bugs.report_bug(
+                bot,
+                f"race: проверка TikTok не удалась для «{query_text}»: {error}",
+            )
+            await notify(i18n.t("auto_search_error", language))
+            return
+
+    if sound is None:
+        logger.info("Фоновый TikTok-поиск не нашёл подходящее аудио для «%s»", query_text)
+        await notify(i18n.t("auto_search_none", language, query=query_text))
+        return
+
     known_entry = sound.get("_existing_entry")
     if known_entry is not None:
         await notify(i18n.t("auto_search_existing", language))
@@ -738,11 +1169,16 @@ async def background_internet_lookup(bot: Bot, requester_id: int, query_text: st
 
     await notify(i18n.t("loads_winner", language, source=source_label, title=title))
 
-    if mif_core.find_duplicate_by_title(title):
+    if not source_type.startswith("tiktok") and mif_core.find_duplicate_by_title(title):
         await notify(i18n.t("auto_search_existing", language))
         return
 
-    status, entry = await _convert_and_publish(bot, audio_bytes, sound)
+    status, entry = await _convert_and_publish(
+        bot,
+        audio_bytes,
+        sound,
+        prepared_audio=prepared_audio,
+    )
 
     if status in ("added", "duplicate") and entry:
         await notify(i18n.t("auto_search_done", language, title=entry["title"]))

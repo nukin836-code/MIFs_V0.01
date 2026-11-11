@@ -1,5 +1,6 @@
 import asyncio
 import html as html_lib
+import json
 import logging
 import re
 from urllib.parse import urlparse, parse_qs
@@ -45,6 +46,11 @@ BING_SEARCH_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+TIKTOK_PAGE_HEADERS = {
+    "User-Agent": SEARCH_HEADERS["User-Agent"],
+    "Accept-Language": "ru,en-US;q=0.9,en;q=0.8",
+}
+
 SSSTIK_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -85,6 +91,124 @@ def _extract_tiktok_video_links(page_html: str) -> tuple[list[str], int]:
             seen.add(href)
             links.append(href)
     return links, len(anchors)
+
+
+def _extract_tiktok_video_results(page_html: str) -> list[dict[str, str]]:
+    """Извлекает прямые ссылки вместе с видимыми заголовками результатов."""
+    soup = BeautifulSoup(page_html, "html.parser")
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor["href"])
+        if "uddg=" in href:
+            href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
+        if not _is_downloadable_tiktok_url(href) or href in seen:
+            continue
+        seen.add(href)
+
+        title = anchor.get_text(" ", strip=True) or str(anchor.get("title", "")).strip()
+        row = anchor.find_parent("tr")
+        snippet = ""
+        if row:
+            snippet_row = row.find_next_sibling("tr")
+            if snippet_row:
+                snippet_cell = snippet_row.find("td")
+                if snippet_cell:
+                    snippet = snippet_cell.get_text(" ", strip=True)
+
+        results.append(
+            {
+                "url": href,
+                "title": title[:300],
+                "snippet": snippet[:500],
+            }
+        )
+    return results
+
+
+def _extract_tiktok_page_metadata(page_html: str) -> dict[str, str]:
+    soup = BeautifulSoup(page_html, "html.parser")
+    script = soup.find("script", id="__UNIVERSAL_DATA_FOR_REHYDRATION__")
+    if not script:
+        return {}
+    try:
+        payload = json.loads(script.string or script.get_text())
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    item = (
+        payload.get("__DEFAULT_SCOPE__", {})
+        .get("webapp.video-detail", {})
+        .get("itemInfo", {})
+        .get("itemStruct", {})
+    )
+    if not isinstance(item, dict):
+        return {}
+    music = item.get("music", {})
+    if not isinstance(music, dict):
+        music = {}
+    return {
+        "caption": str(item.get("desc", ""))[:1000],
+        "music_title": str(music.get("title", ""))[:250],
+        "music_author": str(music.get("authorName", ""))[:250],
+    }
+
+
+async def enrich_tiktok_candidates_async(
+    query: str,
+    candidates: list[dict[str, str]],
+) -> None:
+    """Добавляет подпись ролика и название звуковой дорожки из страницы TikTok."""
+    semaphore = asyncio.Semaphore(3)
+    timeout = aiohttp.ClientTimeout(total=9)
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=TIKTOK_PAGE_HEADERS,
+    ) as session:
+        async def enrich(candidate: dict[str, str]) -> None:
+            url = candidate.get("url", "")
+            if not _is_downloadable_tiktok_url(url):
+                return
+            async with semaphore:
+                try:
+                    async with session.get(url) as response:
+                        if response.status != 200:
+                            logger.debug(
+                                "TikTok metadata ответил HTTP %s для %s",
+                                response.status,
+                                url,
+                            )
+                            return
+                        metadata = _extract_tiktok_page_metadata(await response.text())
+                except Exception:
+                    logger.debug(
+                        "Не удалось получить TikTok metadata для %s",
+                        url,
+                        exc_info=True,
+                    )
+                    return
+
+            caption = metadata.get("caption", "").strip()
+            music_title = metadata.get("music_title", "").strip()
+            music_author = metadata.get("music_author", "").strip()
+            if caption:
+                candidate["caption"] = caption
+                candidate["caption_score"] = str(
+                    mif_core.fuzzy_match_score(query, caption)
+                )
+                if "(TikTok #" in candidate.get("title", ""):
+                    candidate["title"] = caption[:300]
+            if music_title:
+                candidate["music_title"] = music_title
+                candidate["music_author"] = music_author
+                candidate["music_score"] = str(
+                    mif_core.fuzzy_match_score(query, f"{music_title} {music_author}")
+                )
+
+        await asyncio.gather(*(enrich(candidate) for candidate in candidates))
 
 
 def _extract_bing_video_search_links(page_html: str) -> list[str]:
@@ -285,7 +409,7 @@ async def search_catalog_async(
     которые можно передать TikWM/SSSTik.
     """
     search_query = f"tiktok {query}"
-    links: list[str] = []
+    candidates: list[dict[str, str]] = []
     try:
         async with session.post(
             "https://lite.duckduckgo.com/lite/",
@@ -295,7 +419,7 @@ async def search_catalog_async(
         ) as response:
             if response.status == 200:
                 page_html = await response.text()
-                links, _ = _extract_tiktok_video_links(page_html)
+                candidates = _extract_tiktok_video_results(page_html)
             else:
                 logger.info("DDG Lite POST ответил HTTP %s; пробую GET", response.status)
     except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -304,7 +428,7 @@ async def search_catalog_async(
     # Некоторые ответы POST содержат только TikTok-теги вместо видео, а
     # DuckDuckGo Lite может вернуть поисковую капчу. GET оставляем как
     # отменяемый резерв и принимаем только прямые ссылки на ролики.
-    if not links:
+    if not candidates:
         try:
             async with session.get(
                 "https://lite.duckduckgo.com/lite/",
@@ -316,11 +440,11 @@ async def search_catalog_async(
                     logger.info("DDG Lite GET ответил HTTP %s", response.status)
                 else:
                     page_html = await response.text()
-                    links, _ = _extract_tiktok_video_links(page_html)
+                    candidates = _extract_tiktok_video_results(page_html)
         except (aiohttp.ClientError, asyncio.TimeoutError):
             logger.debug("DDG Lite GET не удался для %r; пробую Bing Video", query)
 
-    if not links:
+    if not candidates:
         logger.info(
             "DDG Lite не вернул прямых TikTok-видео для %r; пробую Bing Video",
             query,
@@ -336,22 +460,46 @@ async def search_catalog_async(
                     logger.info("Bing Video ответил HTTP %s", response.status)
                     return []
                 page_html = await response.text()
-                links = _extract_bing_video_search_links(page_html)
+                candidates = [
+                    {"url": link, "title": "", "snippet": ""}
+                    for link in _extract_bing_video_search_links(page_html)
+                ]
         except (aiohttp.ClientError, asyncio.TimeoutError):
             logger.debug("Bing Video поиск не удался для %r", query, exc_info=True)
             return []
 
-    if not links:
+    if not candidates:
         logger.info("DDG Lite и Bing Video не нашли прямых TikTok-видео для %r", query)
         return []
 
     results: list[tuple[int, dict[str, str]]] = []
-    for index, link in enumerate(links[:max_results]):
-        score = max(0, 80 - index * 10)
+    for index, candidate in enumerate(candidates[:max_results]):
+        score = max(0, 80 - index * 5)
         if score >= min_score:
-            results.append(
-                (score, {"title": f"{query} (TikTok #{index + 1})", "url": link})
+            caption = " ".join(
+                part for part in (candidate["title"], candidate["snippet"]) if part
             )
+            caption_score = (
+                mif_core.fuzzy_match_score(query, caption) if caption else 0.0
+            )
+            display_title = candidate["title"] or f"{query} (TikTok #{index + 1})"
+            results.append(
+                (
+                    score,
+                    {
+                        "title": display_title,
+                        "url": candidate["url"],
+                        "caption": caption,
+                        "caption_score": str(caption_score),
+                    },
+                )
+            )
+    logger.info(
+        "TikTok-поиск «%s»: %d прямых роликов, первый заголовок: %s",
+        query,
+        len(results),
+        results[0][1].get("title", "") if results else "нет",
+    )
     return results
 
 
