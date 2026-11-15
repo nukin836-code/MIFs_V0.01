@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 from json import JSONDecodeError
 from pathlib import Path
@@ -31,11 +32,10 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import BufferedInputFile
 from rapidfuzz import fuzz
 
+import database
+
 logger = logging.getLogger("mif-bot.core")
 
-DATABASE_PATH = Path(__file__).with_name("mifs_database.json")
-MUTED_USERS_PATH = Path(__file__).with_name("muted_users.json")
-LEGACY_DATABASE_PATH = Path(__file__).with_name("mifs.json")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@MIFFFKI")
 MAX_CAPTION_TEXT_LENGTH = 300
 TRANSCRIPTION_TIMEOUT_SECONDS = 20
@@ -55,105 +55,9 @@ HASH_WAV_CHANNELS = "1"
 MAX_RATE_LIMIT_RETRIES = 3
 
 
-DEFAULT_MIFS: list[dict[str, str]] = [
-    {
-        "id": "1",
-        "title": "Звук 1",
-        "file_id": "CQACAgIAAxkBAAEuHO9qkZ03pi_mLbWFOsWW01ynB2cZUAACQQ0AAu5m4EjwVpcEQ4qmpz0E",
-        "tags": "окс миф 1",
-        "media_type": "audio",
-        "file_type": "audio",
-        "user_tags": "окс миф 1",
-        "bot_tags": "",
-    },
-    {
-        "id": "2",
-        "title": "Звук 2",
-        "file_id": "CQACAgIAAxkBAAEuHPFqkZ0352jEAWpootn6YibYFZpZowACYGIAAt-jkEgtnX7stJl5Lj0E",
-        "tags": "мем 2",
-        "media_type": "audio",
-        "file_type": "audio",
-        "user_tags": "мем 2",
-        "bot_tags": "",
-    },
-    {
-        "id": "3",
-        "title": "Звук 3",
-        "file_id": "CQACAgIAAxkBAAEuHPJqkZ031jPFF2-6TwFG4V8JEyKEAgACDUkAAhDEgUqWSpFk4iZf9z0E",
-        "tags": "мем 3",
-        "media_type": "audio",
-        "file_type": "audio",
-        "user_tags": "мем 3",
-        "bot_tags": "",
-    },
-    {
-        "id": "4",
-        "title": "Звук 4",
-        "file_id": "CQACAgIAAxkBAAEuHPNqkZ03lpuLxHkyZ92-BqzLJ45uNAACtQoAAmHC0UpMkDlDJZnKTT0E",
-        "tags": "мем 4",
-        "media_type": "audio",
-        "file_type": "audio",
-        "user_tags": "мем 4",
-        "bot_tags": "",
-    },
-    {
-        "id": "5",
-        "title": "Звук 5",
-        "file_id": "CQACAgIAAxkBAAEuHPRqkZ03kWvsJw7X42bCEC1T5cOrYwAC_B4AAl0YqUpRRiT9sSu2Hj0E",
-        "tags": "мем 5",
-        "media_type": "audio",
-        "file_type": "audio",
-        "user_tags": "мем 5",
-        "bot_tags": "",
-    },
-    {
-        "id": "6",
-        "title": "Звук 6",
-        "file_id": "CQACAgIAAxkBAAEuHPBqkZ034-HvwqfoGRjcXCWQogOW4wACqX8AAiq0IUiw_aQAAVa0QZo9BA",
-        "tags": "мем 6",
-        "media_type": "audio",
-        "file_type": "audio",
-        "user_tags": "мем 6",
-        "bot_tags": "",
-    },
-]
-
-def load_mifs() -> list[dict[str, Any]]:
-    source_path = DATABASE_PATH
-    if not source_path.exists() and LEGACY_DATABASE_PATH.exists():
-        source_path = LEGACY_DATABASE_PATH
-
-    if not source_path.exists():
-        return [dict(mif) for mif in DEFAULT_MIFS]
-
-    try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
-    except (OSError, JSONDecodeError) as error:
-        raise RuntimeError(f"Не удалось прочитать базу MIFов: {source_path}") from error
-
-    if not isinstance(data, list):
-        raise RuntimeError("База MIFов должна содержать JSON-массив")
-
-    return data
-
-
-def save_mifs() -> None:
-    temporary_path = DATABASE_PATH.with_suffix(".tmp")
-    temporary_path.write_text(
-        json.dumps(MIFS_DATABASE, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary_path.replace(DATABASE_PATH)
-
-
-def next_mif_id() -> str:
-    numeric_ids = []
-    for mif in MIFS_DATABASE:
-        try:
-            numeric_ids.append(int(str(mif["id"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return str(max(numeric_ids, default=0) + 1)
+# База звуків більше не лежить у JSON-файлі в пам'яті процесу: вона живе в
+# SQLite (див. database.py). Колишні load_mifs/save_mifs/next_mif_id
+# прибрано — ідентифікатори присвоює СКБД, а кожна зміна є транзакцією.
 
 
 def clip_text(value: str, max_length: int = MAX_CAPTION_TEXT_LENGTH) -> str:
@@ -163,26 +67,16 @@ def clip_text(value: str, max_length: int = MAX_CAPTION_TEXT_LENGTH) -> str:
 
 
 def find_duplicate_by_hash(content_hash: str) -> dict[str, Any] | None:
-    for mif in MIFS_DATABASE:
-        if mif.get("content_hash") == content_hash:
-            return mif
-    return None
+    return database.find_by_hash(content_hash)
+
 
 def get_mif_by_id(mif_id: int | str) -> dict[str, Any] | None:
-    """Резолвит ID звука в полную запись. Нужно db_manager.py: Users DB и
-    Popular DB хранят только ID, а не целые записи."""
-    mif_id = str(mif_id)
-    for mif in MIFS_DATABASE:
-        if str(mif.get("id")) == mif_id:
-            return mif
-    return None
+    """Резолвить ID звука в повний запис (пошук за первинним ключем)."""
+    return database.get_sound(mif_id)
+
 
 def find_duplicate_by_title(title: str) -> dict[str, Any] | None:
-    title_key = title.strip().lower()
-    for mif in MIFS_DATABASE:
-        if str(mif.get("title", "")).strip().lower() == title_key:
-            return mif
-    return None
+    return database.find_by_title(title)
 
 
 def _source_url_key(source_url: str) -> str:
@@ -203,7 +97,7 @@ def find_duplicate_by_source_url(source_url: str) -> dict[str, Any] | None:
     source_key = _source_url_key(source_url)
     if not source_key:
         return None
-    for mif in MIFS_DATABASE:
+    for mif in database.fetch_sounds("source_url IS NOT NULL AND source_url <> ''"):
         stored_url = str(mif.get("source_url", "")).strip()
         if stored_url and _source_url_key(stored_url) == source_key:
             return mif
@@ -211,51 +105,19 @@ def find_duplicate_by_source_url(source_url: str) -> dict[str, Any] | None:
 
 
 # --- /mute, /unmute ----------------------------------------------------
-
-
-def _load_muted_users() -> set[int]:
-    if not MUTED_USERS_PATH.exists():
-        return set()
-    try:
-        data = json.loads(MUTED_USERS_PATH.read_text(encoding="utf-8"))
-    except (OSError, JSONDecodeError):
-        logger.exception("Не удалось прочитать список заглушённых пользователей")
-        return set()
-    if not isinstance(data, list):
-        return set()
-    result: set[int] = set()
-    for item in data:
-        try:
-            result.add(int(item))
-        except (TypeError, ValueError):
-            continue
-    return result
-
-
-def _save_muted_users() -> None:
-    temporary_path = MUTED_USERS_PATH.with_suffix(".tmp")
-    temporary_path.write_text(
-        json.dumps(sorted(MUTED_USERS), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary_path.replace(MUTED_USERS_PATH)
-
-
-MUTED_USERS: set[int] = _load_muted_users()
+# Ознака «сповіщення вимкнено» тепер — стовпець users.is_muted.
 
 
 def is_muted(user_id: int) -> bool:
-    return user_id in MUTED_USERS
+    return database.is_muted(user_id)
 
 
 def mute_user(user_id: int) -> None:
-    MUTED_USERS.add(user_id)
-    _save_muted_users()
+    database.set_muted(user_id, True)
 
 
 def unmute_user(user_id: int) -> None:
-    MUTED_USERS.discard(user_id)
-    _save_muted_users()
+    database.set_muted(user_id, False)
 
 
 # --- Поиск (точное вхождение + нечёткий рейтинг через rapidfuzz) -----------
@@ -392,8 +254,11 @@ def find_matching_mifs(query_text: str) -> tuple[list[dict[str, Any]], float]:
         # искать), поэтому best_score = 100.0, а не 0.0.
         return list(MIFS_DATABASE[:MAX_INLINE_RESULTS]), 100.0
 
+    # Один знімок таблиці на весь виклик: ключ id(mif) нижче має сенс лише
+    # для одних і тих самих об'єктів (SoundsView щоразу будує нові словники).
+    records = list(MIFS_DATABASE)
     scored_by_record: dict[int, tuple[float, dict[str, Any]]] = {}
-    for mif in MIFS_DATABASE:
+    for mif in records:
         user_tags = str(mif.get("user_tags", mif.get("tags", ""))).lower()
         bot_tags = str(mif.get("bot_tags", mif.get("bot_description", ""))).lower()
 
@@ -408,7 +273,7 @@ def find_matching_mifs(query_text: str) -> tuple[list[dict[str, Any]], float]:
             str(mif.get(field, ""))
             for field in ("title", "user_tags", "tags")
         ).casefold()
-        for mif in MIFS_DATABASE
+        for mif in records
     )
 
     # Exact local matches need no network translation. This keeps the inline
@@ -419,7 +284,7 @@ def find_matching_mifs(query_text: str) -> tuple[list[dict[str, Any]], float]:
         [token for token in translated.lower().strip().split() if token] if translated else []
     )
     if translated_tokens:
-        for mif in MIFS_DATABASE:
+        for mif in records:
             user_tags = str(mif.get("user_tags", mif.get("tags", ""))).lower()
             bot_tags = str(mif.get("bot_tags", mif.get("bot_description", ""))).lower()
             translated_score = _score_mif_tokens(translated_tokens, user_tags, bot_tags)
@@ -435,12 +300,10 @@ def find_matching_mifs(query_text: str) -> tuple[list[dict[str, Any]], float]:
     return [mif for _, mif in scored[:MAX_INLINE_RESULTS]], best_score
 
 
-# Загружается один раз при первом импорте этого модуля и переиспользуется
-# всеми остальными модулями (main.py, mif_loader.py, import_myinstants.py) —
-# Python кеширует модули, так что это гарантированно один и тот же список.
-MIFS_DATABASE: list[dict[str, Any]] = load_mifs()
-if not DATABASE_PATH.exists() and LEGACY_DATABASE_PATH.exists():
-    save_mifs()
+# «Віконце» на таблицю sounds: поводиться як список словників, але щоразу
+# читає актуальні дані з SQLite, тому бот, Mini App і завантажувачі завжди
+# бачать однакову базу (без перезапуску процесів).
+MIFS_DATABASE = database.SoundsView()
 
 
 # --- ffmpeg / хэш / распознавание речи --------------------------------------
@@ -758,25 +621,23 @@ async def publish_voice_mif(
                 sent_message.message_id,
             )
 
-        new_mif: dict[str, Any] = {
-            "id": next_mif_id(),
-            "title": title,
-            "file_id": resolved_file_id,
-            "file_type": "voice",
-            "media_type": "voice",
-            "user_description": title,
-            "bot_description": bot_description,
-            "user_tags": tags_text.lower(),
-            "bot_tags": bot_description.lower(),
-            "tags": tags_text.lower(),
-            "channel_message_id": sent_message.message_id,
-            "content_hash": content_hash,
-        }
-        if source_url:
-            new_mif["source_url"] = source_url
+        try:
+            new_mif = database.insert_sound(
+                title=title,
+                file_id=resolved_file_id,
+                file_type="voice",
+                bot_description=bot_description,
+                content_hash=content_hash or f"nohash:{sent_message.message_id}",
+                channel_message_id=sent_message.message_id,
+                source_url=source_url,
+                tags_text=tags_text,
+            )
+        except sqlite3.IntegrityError:
+            # Інший процес устиг додати цей самий звук (UNIQUE content_hash).
+            existing = find_duplicate_by_hash(content_hash) if content_hash else None
+            if existing is not None:
+                return "duplicate", existing
+            raise
         if extra_fields:
             new_mif.update(extra_fields)
-
-        MIFS_DATABASE.append(new_mif)
-        save_mifs()
         return "added", new_mif

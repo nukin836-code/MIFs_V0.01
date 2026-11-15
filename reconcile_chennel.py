@@ -1,5 +1,5 @@
 """
-Скрипт сверки локального кэша mifs_database.json с историей канала @MIFFFKI.
+Скрипт сверки локальной базы (SQLite, database.py) с историей канала @MIFFFKI.
 
 ИДЕЯ: канал — источник правды. Этот скрипт проходит по ВСЕЙ истории канала и
 добавляет в локальный JSON-кэш те записи, которых там почему-то нет.
@@ -66,9 +66,10 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from pyrogram import Client
 
+import database as database_layer
+
 logger = logging.getLogger("mif-reconcile")
 
-DATABASE_PATH = Path(__file__).with_name("mifs_database.json")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@MIFFFKI")
 SESSION_NAME = "admin_session"
 
@@ -88,24 +89,15 @@ SOURCE_RE = re.compile(r"Источник:\s*(\S+)")
 
 
 def load_database() -> list[dict[str, Any]]:
-    if not DATABASE_PATH.exists():
-        return []
-    try:
-        data = json.loads(DATABASE_PATH.read_text(encoding="utf-8"))
-    except (OSError, JSONDecodeError) as error:
-        raise RuntimeError(f"Не удалось прочитать базу MIFов: {DATABASE_PATH}") from error
-    if not isinstance(data, list):
-        raise RuntimeError("База MIFов должна содержать JSON-массив")
-    return data
+    """Поточний вміст БД MIFki (SQLite) у форматі списку словників."""
+    return list(database_layer.SoundsView())
 
 
 def save_database(database: list[dict[str, Any]]) -> None:
-    temporary_path = DATABASE_PATH.with_suffix(".tmp")
-    temporary_path.write_text(
-        json.dumps(database, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary_path.replace(DATABASE_PATH)
+    """Дописує в БД записи, яких там ще немає (за content_hash). Раніше
+    переписувала mifs_database.json цілком; тепер кожен запис додається
+    окремою транзакцією, тому скрипт безпечно запускати поки бот працює."""
+    database_layer.sync_sounds(database)
 
 
 def next_id(database: list[dict[str, Any]]) -> int:
